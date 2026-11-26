@@ -59,6 +59,14 @@
    `status.wait_for(Failed)` ; dans ce dernier cas il annule le jeton racine et sort en code 1.
    Écarté : donner le jeton racine au superviseur (il pourrait arrêter toute l'application,
    couplage du cœur au cycle de vie applicatif) ; canal `oneshot` dédié (doublon de `watch`).
+   **Complément (implémentation, 2026-11-26)** : une **fin du thread de capture sans `Failed`**
+   (panique) est une fin anormale, traitée comme une erreur fatale (code 1) : un serveur sans
+   capture vivante ne diffuserait plus rien tout en se déclarant sain. Un gardien RAII
+   (`PanicGuard`) publie `Failed` pendant le déroulement de la panique ; `app` traite en plus
+   la fermeture du canal d'état sans `Failed` comme une fin anormale, et
+   `CaptureHandle::join` renvoie `CaptureThreadError::Panicked`. Les paniques des `Drop` de
+   `v4l` sont contenues dans l'adaptateur (`catch_unwind`). Voir
+   [architecture § 7.1](../architecture.md#71-décisions-prises-à-limplémentation-points-ouverts-de-la-revue).
 6. **Limite de clients par `tokio::sync::Semaphore`** (`MaxClients` permis) dans `server` :
    `Arc<Semaphore>::try_acquire_owned()` réserve une place sans attente (échec → `503`) et
    renvoie un `OwnedSemaphorePermit` libéré à la destruction (**RAII**). Remplace le compteur
@@ -77,6 +85,12 @@
    trame (nécessite un chien de garde par connexion, hyper ne sondant plus le corps quand
    l'écriture est bloquée). L'arrêt global reste borné par `shutdown_timeout`
    (voir [architecture](../architecture.md#54-arrêt-propre-sigterm)).
+   **Complément (implémentation v1, 2026-11-26)** : les options sont appliquées par
+   `axum::serve::ListenerExt::tap_io` (axum 0.8, confirmé) ; `TCP_NODELAY` est ajouté
+   (`TcpOptions::nodelay`, vrai par défaut) pour émettre chaque partie MJPEG sans délai de
+   Nagle ; une erreur d'application des options n'est pas fatale (connexion servie sans elles).
+   Pour la décision 6, le limiteur est `server::mjpeg::ClientLimiter` et le permis est détenu
+   par l'état du corps MJPEG (`ClientSession`).
 
 `watch` reste une alternative valable pour les trames (sémantique « dernière image ») : si les
 mesures sur Pi montrent une latence ou une mémoire excessive avec `broadcast`, le remplacement

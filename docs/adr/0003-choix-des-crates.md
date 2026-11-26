@@ -47,7 +47,7 @@ coût de cross-compilation à prendre en compte.
 |---|---|---|
 | Runtime | `tokio` | `rt-multi-thread`, `macros`, `net`, `signal`, `sync`, `time` |
 | Arrêt coordonné | `tokio-util` | `CancellationToken` (utilisable depuis un thread synchrone via `is_cancelled()`) |
-| HTTP | `axum` | features par défaut réduites au besoin (`http1`, `tokio`, `json`) |
+| HTTP | `axum` | features par défaut réduites au besoin (`http1`, `tokio`, `json`, `tracing`) |
 | Flux du corps HTTP | `futures-util` | `stream::unfold` (déjà tiré par axum) |
 | Trames sans copie | `bytes` | `Bytes` partagé entre clients |
 | V4L2 | **`v4l`** | feature `v4l2` (pas de dépendance d'exécution à libv4l) ; derrière la feature Cargo `v4l2` de Camstream |
@@ -57,7 +57,8 @@ coût de cross-compilation à prendre en compte.
 | Erreurs | `thiserror`, `anyhow` | `anyhow` uniquement dans `main.rs` / `app` |
 | Logs | `tracing`, `tracing-subscriber` | `fmt`, `env-filter` |
 | Encodage JPEG (repli YUYV, **phase 2**) | `jpeg-encoder` | 100 % Rust, optionnelle (feature `yuyv`) |
-| Tests | `tower` (`util`), `http-body-util` | dev-dependencies uniquement |
+| Codes `errno` (adaptateur V4L2) | `libc` | optionnelle, activée par la feature `v4l2` ; déjà tirée par `v4l` |
+| Tests | `tower` (`util`), `http-body-util`, `hyper` (`client`, `http1`), `hyper-util` (`tokio`), `serde_json` | dev-dependencies uniquement ; toutes déjà dans le graphe via axum (le client HTTP/1.1 de hyper lit le flux multipart morceau par morceau) |
 
 Le choix de `v4l` est conditionné à un **spike de cross-compilation** (bindgen vers
 `aarch64-unknown-linux-gnu`) en tout début d'implémentation. En cas d'échec ou de coût
@@ -70,6 +71,12 @@ changement n'impacte que `src/capture/v4l2/`.
 > d'exécution V4L2. Restent à mesurer sur le Raspberry Pi le comportement de la crate avec une
 > webcam réelle. Le statut reste « Proposé » jusqu'à ces mesures :
 > [spike 0001](../spikes/0001-v4l.md).
+
+> **Complément (implémentation, 2026-11-26)** : versions retenues dans `Cargo.lock` :
+> `tokio` 1.54, `axum` 0.8.9, `socket2` 0.6.5, `clap` 4.6, `v4l` 0.14.0, `thiserror` 2.
+> `rust-version` = **1.88** : imposé par `home` 0.5.12, dépendance de build de bindgen via
+> `v4l2-sys-mit` (1.85 suffirait sans la feature `v4l2`). Pas de feature `yuyv` ni de
+> `jpeg-encoder` en v1 (phase 2).
 
 ## Conséquences
 

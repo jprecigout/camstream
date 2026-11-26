@@ -1,0 +1,46 @@
+# Camstream : capture d'une webcam USB (V4L2) et diffusion MJPEG vers les navigateurs.
+# Crate unique (bibliothèque + binaire), architecture hexagonale (docs/adr/0001).
+# Choix des dépendances : docs/adr/0003-choix-des-crates.md.
+[package]
+name = "camstream"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+description = "Stream a USB webcam (V4L2, native MJPEG) to web browsers, built for Raspberry Pi"
+repository = "https://github.com/jprecigout/camstream"
+readme = "README.md"
+
+[features]
+default = ["v4l2"]
+# Adaptateur webcam V4L2 (crate `v4l`, bindings générés par bindgen au build).
+# Sans cette feature, seule la source synthétique est disponible.
+v4l2 = ["dep:v4l", "dep:libc"]
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "tracing"] }
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+futures-util = { version = "0.3", default-features = false }
+libc = { version = "0.2", optional = true }
+serde = { version = "1", features = ["derive"] }
+# Feature `all` requise pour `TCP_USER_TIMEOUT` et le nombre de sondes keepalive.
+socket2 = { version = "0.6", features = ["all"] }
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "ansi", "env-filter"] }
+v4l = { version = "0.14", default-features = false, features = ["v4l2"], optional = true }
+
+[dev-dependencies]
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+serde_json = "1"
+tower = { version = "0.5", features = ["util"] }
+
+[profile.release]
+strip = "symbols"
+lto = "thin"

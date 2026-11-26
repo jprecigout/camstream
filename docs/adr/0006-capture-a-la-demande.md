@@ -66,6 +66,12 @@ Contraintes :
    détruit aussitôt s'il n'y a aucun abonné. Une erreur `Fatal` (droits, format) arrête
    l'application immédiatement (`Failed`, code 1) ; une erreur `Reopen` (webcam absente) est
    journalisée en `warn` et l'état passe à `Idle` : on ne réessaie qu'en présence de demande.
+   **Complément (implémentation, 2026-11-26)** : le serveur écoute avant le lancement de la
+   capture, un client peut donc s'abonner pendant la sonde. Si des abonnés sont présents à
+   l'issue d'une sonde réussie, la source est **conservée** et sert directement (la fermer
+   pour la rouvrir aussitôt ajouterait la latence d'ouverture au premier spectateur) ; si la
+   sonde échoue en `Reopen` alors que des abonnés attendent, la reconnexion démarre
+   (`Reconnecting`, tentative 1). Voir [architecture § 7.1](../architecture.md#71-décisions-prises-à-limplémentation-points-ouverts-de-la-revue).
 4. **Premier client** : le handler s'abonne **avant** de répondre (la demande est donc
    visible immédiatement), puis envoie `200` et les en-têtes ; les parties JPEG suivent dès
    que la webcam produit. La page HTML affiche un texte d'attente jusqu'au premier
@@ -79,6 +85,19 @@ Contraintes :
    (jeton, demande, minuterie). Le `Handle` est injecté au superviseur par `app`.
    `Handle::block_on` est autorisé depuis un thread hors runtime, ce qui est le cas.
 7. **`/health`** : `Idle` est un état sain → `200`, `"state": "idle"` dans le JSON.
+
+> **Complément (implémentation v1, 2026-11-26)** :
+>
+> - `Streaming` n'est publié qu'à la **première trame** reçue (une source ouverte mais muette
+>   reste `Starting` ou `Reconnecting`) : `/health` ne dit `streaming` que si des images
+>   circulent ;
+> - le compteur de demande est un `watch::Sender<usize>` cloné dans chaque abonné (il est
+>   `Clone` depuis tokio 1.37), sans `Arc` ;
+> - `App::bind` refuse un runtime `current_thread` (erreur explicite) : `Handle::block_on`
+>   depuis le thread de capture n'y ferait pas avancer les minuteries ;
+> - comportement vérifié par `tests/supervisor.rs` (grâce, réabonnement rapide, délai nul,
+>   sonde avec abonnés, reconnexion abandonnée sans spectateur, annulation d'une longue
+>   attente) avec une fabrique scriptée.
 
 ## Conséquences
 

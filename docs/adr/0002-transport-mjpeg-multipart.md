@@ -63,6 +63,13 @@ Points de conception :
 - un nombre maximal de clients simultanés est configurable (`CAMSTREAM_MAX_CLIENTS`) ; au-delà,
   réponse `503 Service Unavailable`.
 
+> **Complément (implémentation v1, 2026-11-26)** : le CRLF qui termine chaque image est émis
+> en tête de l'en-tête de la partie suivante (délimiteur `CRLF--frame` de la RFC 2046), ce qui
+> garde deux morceaux par trame ; le refus au-delà de `CAMSTREAM_MAX_CLIENTS` porte
+> `Retry-After: 5` ; `TCP_NODELAY` est activé sur chaque connexion (ADR 0004, décision 7) ; les
+> trames sont vérifiées (`SOI`/`EOI`, bourrage final retiré) avant diffusion, sans décodage
+> (`capture::jpeg`).
+
 ## Conséquences
 
 - Le contrat du port `FrameSource` impose des trames **JPEG** : le format YUYV de repli doit

@@ -1,22 +1,22 @@
 # Catalogue des design patterns
 
-> Statut : **conception initiale (proposée)**. Les emplacements indiqués sont les fichiers
-> **prévus** (voir [architecture.md](architecture.md#2-découpage-en-modules)). Conformément à
-> `CLAUDE.md`, chaque type concerné nommera son pattern dans son commentaire `///`
-> (ex. « Implémente le pattern **Strategy** »), et ce catalogue sera mis à jour dans le même
-> commit que le code.
+> Statut : **v1 implémentée**. Les emplacements indiqués sont les fichiers et types **réels**
+> (voir [architecture.md](architecture.md#2-découpage-en-modules)). Conformément à `CLAUDE.md`,
+> chaque type concerné nomme son pattern dans son commentaire `///` (ex. « Implémente le
+> pattern **Strategy** ») ; ce catalogue est mis à jour dans le même commit que le code.
 
 ## Synthèse
 
-| Pattern | Catégorie | Problème résolu | Où (prévu) |
+| Pattern | Catégorie | Problème résolu | Où |
 |---|---|---|---|
-| [Strategy](#strategy) | Comportement | Remplacer la webcam par une autre source sans toucher au cœur | `src/domain/source.rs` — `FrameSource` |
-| [Observer / Publish-Subscribe](#observer--publish-subscribe) | Comportement | Livrer chaque trame à N clients sans que les lents bloquent ; réveiller la capture au premier client | `src/stream/hub.rs` — `FrameHub`, `FrameSubscriber`, `DemandReceiver` |
+| [Strategy](#strategy) | Comportement | Remplacer la webcam par une autre source sans toucher au cœur | `src/domain/source.rs` — `FrameSource` ; `V4l2Source`, `SyntheticSource`, `ScriptedSource` (tests) |
+| [Observer / Publish-Subscribe](#observer--publish-subscribe) | Comportement | Livrer chaque trame à N clients sans que les lents bloquent ; réveiller la capture au premier client | `src/stream/hub.rs` — `FrameHub`, `FrameSubscriber`, `DemandReceiver` ; `src/stream/status.rs` — `SourceStatus` |
 | [Adapter](#adapter) | Structure | Isoler la crate `v4l` et axum derrière nos propres types | `src/capture/v4l2/` — `V4l2Device`, `V4l2Source` ; `src/server/` |
-| [Factory](#factory) | Création | Recréer une source après déconnexion sans connaître son type | `src/domain/source.rs` — `FrameSourceFactory` ; `src/capture/factory.rs` — `SourceFactory` |
+| [Factory](#factory) | Création | Recréer une source après déconnexion sans connaître son type | `src/domain/source.rs` — `FrameSourceFactory` ; `src/capture/factory.rs` — `SourceFactory` ; `ScriptedFactory` (tests) |
 | [Builder](#builder) | Création | Construire le serveur avec paramètres obligatoires et optionnels | `src/server/mod.rs` — `ServerBuilder` |
-| [Newtype](#newtype) | Idiome Rust | Interdire les valeurs invalides ou confondues | `src/domain/frame.rs`, `src/domain/device.rs`, `src/stream/hub.rs`, `src/server/mod.rs` |
-| [RAII](#raii) | Idiome Rust | Libérer périphérique, tampons, abonnements, demande et places client sans oubli | `V4l2Source`, `FrameSubscriber`, `OwnedSemaphorePermit` |
+| [DTO](#dto-data-transfer-object) | Structure | Contrat JSON de `/health` indépendant des types du cœur | `src/server/health.rs` — `HealthReport`, `CameraReport`, `SourceReport` |
+| [Newtype](#newtype) | Idiome Rust | Interdire les valeurs invalides ou confondues | `src/domain/frame.rs`, `src/domain/device.rs`, `src/stream/hub.rs`, `src/server/mjpeg.rs` |
+| [RAII](#raii) | Idiome Rust | Libérer périphérique, tampons, abonnements, demande et places client sans oubli ; signaler une panique | `V4l2Source`, `Released<T>`, `FrameSubscriber`, `ClientSession`, `OwnedSemaphorePermit`, `PanicGuard` |
 | [Typestate](#typestate) | Idiome Rust | Garantir l'ordre ouvrir → configurer → streamer à la compilation | `src/capture/v4l2/device.rs` — `V4l2Device<S>` |
 
 ---
@@ -29,7 +29,7 @@
   abstraction, le cœur dépendrait de V4L2 et ne serait testable qu'avec du matériel.
 - **Où** : trait `FrameSource` (`src/domain/source.rs`) ; stratégies `V4l2Source`
   (`src/capture/v4l2/source.rs`), `SyntheticSource` (`src/capture/synthetic.rs`),
-  `ScriptedSource` (tests, `tests/support/`).
+  `ScriptedSource` (tests, `tests/support/mod.rs`).
 - **Choix Rust** : objet trait `Box<dyn FrameSource>` plutôt que générique, car la stratégie est
   choisie **à l'exécution** (configuration) et recréée à chaque reconnexion ; le coût d'un appel
   dynamique par trame est négligeable.
@@ -63,7 +63,8 @@ classDiagram
   jamais attendre un client lent ([ADR 0004](adr/0004-distribution-des-trames-et-concurrence.md)).
 - **Où** : `FrameHub` (sujet / éditeur) et `FrameSubscriber` (observateur / abonné) dans
   `src/stream/hub.rs`, construits sur `tokio::sync::broadcast`. Variante « dernière valeur »
-  pour l'état : `watch<SourceStatus>` (`src/stream/status.rs`).
+  pour l'état : `watch<SourceStatus>` (`src/stream/status.rs`), observé par `/health`
+  (`src/server/health.rs`) et par `BoundApp::run` (`src/app.rs`).
 - **Politique clients lents** : `RecvError::Lagged(n)` est absorbé par `FrameSubscriber` (trames
   sautées comptées), le client continue.
 - **Seconde observation, en sens inverse : la demande** ([ADR 0006](adr/0006-capture-a-la-demande.md)).
@@ -93,8 +94,8 @@ classDiagram
         +wait_for_subscribers()
         +wait_for_no_subscribers()
     }
-    class MjpegStream {
-        <<server>>
+    class ClientSession {
+        <<server mjpeg>>
     }
     class WebRtcTransport {
         <<futur>>
@@ -104,7 +105,7 @@ classDiagram
     CaptureSupervisor --> DemandReceiver : observe la demande
     FrameSubscriber ..> DemandReceiver : plus 1 à la création, moins 1 au drop
     FrameHub "1" ..> "0..*" FrameSubscriber : diffuse
-    MjpegStream --> FrameSubscriber : possède
+    ClientSession --> FrameSubscriber : possède
     WebRtcTransport ..> FrameSubscriber : possèdera
 ```
 
@@ -121,7 +122,9 @@ classDiagram
     `PermissionDenied`, `ENOENT` → `DeviceNotFound`). `EPERM` est le code renvoyé par le
     cgroup de périphériques de Docker ; `ENODEV`/`ENXIO` à l'**ouverture** (nœud présent dans
     le conteneur mais webcam débranchée) doivent mener à `Reopen`, pas à une erreur fatale ;
-  - côté entrant : `src/server/` adapte le `FrameHub` au protocole HTTP multipart.
+  - côté entrant : `src/server/` adapte le `FrameHub` au protocole HTTP multipart
+    (`src/server/mjpeg.rs`, fonction `stream` et `ClientSession`).
+- **Traduction des erreurs** : `src/capture/v4l2/errno.rs` (`map_open_error`, `map_io_error`).
 
 ```mermaid
 classDiagram
@@ -130,8 +133,8 @@ classDiagram
         +next_frame() Result~Frame~
     }
     class V4l2Source {
-        -stream v4l_MmapStream
-        -negotiated NegotiatedFormat
+        -stream Released_MmapStream
+        -description SourceDescription
         -sequence SequenceNumber
         +next_frame() Result~Frame~
     }
@@ -156,7 +159,9 @@ classDiagram
   concret, et elle est remplaçable en test (fabrique qui échoue N fois puis réussit, pour tester
   la reconnexion).
 - **Où** : port `FrameSourceFactory` (`src/domain/source.rs`), implémentation `SourceFactory`
-  (`src/capture/factory.rs`), fabriques de test dans `tests/`.
+  (`src/capture/factory.rs`), fabrique de test `ScriptedFactory` (`tests/support/mod.rs` :
+  échecs, pertes et paniques scriptés, compteurs d'ouvertures et de sources vivantes).
+  `App::with_factory` (`src/app.rs`) l'injecte dans l'application complète.
 
 ```mermaid
 classDiagram
@@ -168,13 +173,14 @@ classDiagram
         -settings CaptureSettings
         +create() Result~BoxFrameSource~
     }
-    class FlakyFactory {
+    class ScriptedFactory {
         <<test>>
-        -failures_left u32
+        -steps VecDeque~Step~
+        -probe Probe
     }
     class CaptureSupervisor
     FrameSourceFactory <|.. SourceFactory
-    FrameSourceFactory <|.. FlakyFactory
+    FrameSourceFactory <|.. ScriptedFactory
     CaptureSupervisor o-- FrameSourceFactory : injectée
     SourceFactory ..> V4l2Source : crée si V4l2
     SourceFactory ..> SyntheticSource : crée si Synthetic
@@ -187,7 +193,7 @@ classDiagram
   récepteur d'état, jeton d'arrêt) et des options avec défauts (`MaxClients`, éventuellement
   délais). Un constructeur à 6 paramètres serait illisible et fragile ; le builder rend chaque
   paramètre explicite et `build()` valide l'ensemble (`ServerError::MissingParameter`).
-- **Où** : `ServerBuilder` → `Server` (`src/server/mod.rs`).
+- **Où** : `ServerBuilder` → `Server` → `BoundServer` (`src/server/mod.rs`).
 
 ```mermaid
 classDiagram
@@ -196,19 +202,62 @@ classDiagram
         -hub Option~FrameHub~
         -status Option~StatusReceiver~
         -max_clients MaxClients
+        -tcp_options TcpOptions
         -shutdown Option~CancellationToken~
         +new(bind) ServerBuilder
         +hub(hub) ServerBuilder
         +status(rx) ServerBuilder
         +max_clients(max) ServerBuilder
+        +tcp_options(options) ServerBuilder
         +shutdown(token) ServerBuilder
         +build() Result~Server~
     }
     class Server {
         +router() Router
+        +bind() BoundServer
         +run() Result
     }
     ServerBuilder ..> Server : build()
+```
+
+## DTO (Data Transfer Object)
+
+- **Catégorie** : structure.
+- **Problème résolu** : `/health` expose un contrat JSON stable, consommé par la sonde Docker
+  et la supervision. Dériver `serde::Serialize` sur `SourceStatus` lierait ce contrat aux noms
+  internes du cœur et ajouterait `serde` au cœur pour un unique endpoint. Le DTO et sa
+  conversion explicite `From<&SourceStatus>` rendent visible toute modification du contrat.
+- **Où** : `HealthReport`, `CameraReport`, `SourceReport` (`src/server/health.rs`).
+
+```mermaid
+classDiagram
+    class SourceStatus {
+        <<enumeration, cœur>>
+    }
+    class SourceDescription {
+        <<cœur>>
+    }
+    class HealthReport {
+        <<DTO serde>>
+        +status HealthState
+        +camera CameraReport
+        +clients usize
+        +http_status() StatusCode
+    }
+    class CameraReport {
+        <<DTO serde>>
+        +state str
+        +source Option~SourceReport~
+        +attempt Option~u32~
+        +error Option~String~
+    }
+    class SourceReport {
+        <<DTO serde>>
+    }
+    HealthReport *-- CameraReport
+    CameraReport *-- SourceReport
+    CameraReport ..> SourceStatus : From
+    SourceReport ..> SourceDescription : From
 ```
 
 ## Newtype
@@ -219,14 +268,14 @@ classDiagram
   une fois, à la construction ; ensuite le type garantit l'invariant (ex. non nul).
 - **Où** :
 
-| Newtype | Invariant | Fichier prévu |
+| Newtype | Invariant | Fichier |
 |---|---|---|
 | `Resolution` | largeur et hauteur non nulles, analyse « 640x480 » | `src/domain/frame.rs` |
 | `Fps` | non nul | `src/domain/frame.rs` |
 | `SequenceNumber` | monotone, attribué par la source | `src/domain/frame.rs` |
 | `DevicePath` | chemin de périphérique | `src/domain/device.rs` |
 | `HubCapacity` | non nulle (`broadcast` panique sur 0) | `src/stream/hub.rs` |
-| `MaxClients` | non nul | `src/server/mod.rs` |
+| `MaxClients` | non nul | `src/server/mjpeg.rs` (réexporté par `server`) |
 
 ```mermaid
 classDiagram
@@ -268,7 +317,14 @@ classDiagram
   - `OwnedSemaphorePermit` (obtenu par `ClientLimiter::try_acquire`, `src/server/mjpeg.rs`) :
     rend la place de client au `Semaphore` à sa destruction, même si le client coupe
     brutalement la connexion. Il remplace le `ClientSlot` maison sur `AtomicUsize` envisagé
-    d'abord : même idiome, mais fourni et éprouvé par tokio, sans course possible.
+    d'abord : même idiome, mais fourni et éprouvé par tokio, sans course possible. Il est
+    possédé, avec le `FrameSubscriber`, par `ClientSession` (état du corps MJPEG), dont le
+    `Drop` journalise la déconnexion ;
+  - `Released<T>` (`src/capture/v4l2/release.rs`) : détruit le flux mmap et le périphérique
+    `v4l` sous `catch_unwind`, pour qu'une panique d'un `Drop` de `v4l` ne tue pas le thread
+    de capture ;
+  - `PanicGuard` (`src/stream/supervisor.rs`) : gardien détruit en dernier dans le thread de
+    capture ; s'il est détruit pendant une panique, il publie `Failed`.
 
 ```mermaid
 sequenceDiagram
@@ -278,7 +334,7 @@ sequenceDiagram
     participant Permit as OwnedSemaphorePermit
     participant Sup as CaptureSupervisor
     H->>B: écriture échouée, client parti
-    H->>B: drop
+    H->>B: drop de ClientSession
     B->>Sub: drop donc désabonnement et demande moins 1
     Sub-->>Sup: demande à 0, début du délai de grâce
     B->>Permit: drop donc place rendue au Semaphore
