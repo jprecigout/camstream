@@ -68,6 +68,29 @@ Si une frontière est violée de façon répétée, ou si une seconde caméra im
 compilations conditionnelles lourdes, la migration vers l'option C sera réévaluée par un
 nouvel ADR.
 
+> **Complément (revue d'architecture de l'implémentation v1, 2026-11-26)** — sens des
+> dépendances vérifié dans le code (`use` et chemins `crate::` de chaque module) :
+>
+> - `domain` : `bytes`, `thiserror` et `std` uniquement (aucun `tokio`, `serde`, `clap`, `v4l`) ;
+> - `stream` : `domain`, `tokio` (`sync`, `time`, et `runtime::Handle` pour les attentes du
+>   thread de capture, ADR 0006), `tokio-util` (`CancellationToken`), `thiserror`, `tracing` ;
+>   aucun `axum`, `v4l`, `serde`, `clap`. Le tableau ci-dessus (« `tokio::sync` ») est élargi
+>   en conséquence ;
+> - `capture` : `domain`, `v4l`/`libc` (feature `v4l2`), `bytes`, `tracing` ; ni `tokio` ni
+>   `server` ni `config` ;
+> - `server` : `stream`, `domain`, `axum`, `serde`, `socket2`, `tokio`, `futures-util` ; jamais
+>   `capture` ni `config` ;
+> - `config` : `domain`, `clap` ; `anyhow` limité à `app.rs` et `main.rs`.
+>
+> Le cœur compile et ses tests passent sans la feature `v4l2` (`cargo test
+> --no-default-features`). Évolutions de frontières acceptées : le port `CaptureError` gagne
+> `NotACaptureDevice` et `SourceNotAvailable` (fatales) et perd `#[from] std::io::Error`
+> (traduction explicite des `errno` par l'adaptateur) ; la racine de composition est
+> `App::new` / `App::with_factory` → `App::bind` → `BoundApp::run(shutdown)` → `Outcome`, la
+> fabrique et le futur d'arrêt étant injectés (cycle de vie testable sans matériel ni signal) ;
+> la configuration est lue par `Command::load` (`Serve(AppConfig)` ou
+> `Healthcheck(HealthcheckConfig)`). Détails : [architecture § 11](../architecture.md#11-écarts-entre-la-conception-initiale-et-limplémentation).
+
 ## Conséquences
 
 - Les tests du cœur et du serveur utilisent la source synthétique (`SyntheticSource`) et une

@@ -44,6 +44,12 @@ Points techniques à prendre en compte :
   seulement par le proxy (réseau Docker interne ou `127.0.0.1`). Ce choix fera l'objet d'un
   nouvel ADR remplaçant celui-ci.
 
+> **Complément (implémentation v1, 2026-11-26)** : vérifié dans le code — `CAMSTREAM_BIND`
+> vaut `127.0.0.1` par défaut (`config/cli.rs`), l'image fixe `0.0.0.0` ; le routeur ne déclare
+> que des routes `GET` (`/`, `/stream.mjpg`, `/health`) ; la sonde `camstream healthcheck`
+> interroge la boucle locale quand l'écoute est `0.0.0.0`/`::` ; le `docker-compose.yml`
+> publie le port sur une adresse LAN d'exemple.
+
 ## Conséquences
 
 - Le `README` et la page d'accueil n'annoncent aucune protection : la documentation de

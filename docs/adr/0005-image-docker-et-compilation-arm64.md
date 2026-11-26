@@ -53,6 +53,14 @@
 
 Distroless pourra remplacer `bookworm-slim` une fois le déploiement stabilisé (nouvel ADR).
 
+> **Complément (implémentation v1, 2026-11-26)** : le `Dockerfile` n'installe la chaîne
+> croisée arm64 (`gcc-aarch64-linux-gnu`, `*-arm64-cross`) et n'exporte l'éditeur de liens et la
+> sysroot bindgen **que si `$BUILDARCH` ≠ `$TARGETARCH`** : un build natif (runner ARM, Mac
+> Apple Silicon, ou `amd64` de développement) n'en dépend pas ; toute autre cible croisée est
+> refusée explicitement. `rust-version` = 1.88 (ADR 0003). Le `.dockerignore` réduit le contexte
+> à ce qui sert à compiler. Statut toujours « Proposé » : build `linux/arm64` et exécution sur
+> le Pi restent à mesurer.
+
 ## Conséquences
 
 - Les détails (Dockerfile prévu, compose, variables) sont décrits dans
