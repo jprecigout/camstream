@@ -2,7 +2,7 @@
 
 > Statut : **conception initiale (proposée)**, avant implémentation. Les décisions sont tracées
 > dans les ADR [0001](adr/0001-architecture-hexagonale-et-decoupage-en-modules.md) à
-> [0005](adr/0005-image-docker-et-compilation-arm64.md). Les signatures Rust de ce document
+> [0007](adr/0007-securite-reseau-local-v1.md). Les signatures Rust de ce document
 > sont des **propositions** : l'implémentation peut les ajuster (noms de champs privés,
 > détails d'API des crates), mais toute modification d'un **port** (trait) ou d'une frontière
 > entre modules passe par une revue d'architecture.
@@ -20,6 +20,8 @@ Exigences principales :
 | Plusieurs clients, clients lents non bloquants | `FrameHub` sur `tokio::sync::broadcast` borné, trames sautées en cas de retard ([ADR 0004](adr/0004-distribution-des-trames-et-concurrence.md)) |
 | Capture V4L2 bloquante | Thread OS dédié, jamais sur le runtime tokio |
 | Webcam débranchée / rebranchée | `CaptureSupervisor` + `FrameSourceFactory`, reconnexion avec attente exponentielle |
+| Webcam éteinte sans spectateur | Capture à la demande : compteur d'abonnés du `FrameHub`, délai de grâce, état `Idle` ([ADR 0006](adr/0006-capture-a-la-demande.md)) |
+| Usage réseau local uniquement (v1) | Pas d'authentification ni de TLS, écoute `127.0.0.1` par défaut hors conteneur ([ADR 0007](adr/0007-securite-reseau-local-v1.md)) |
 | Arrêt propre sur `SIGTERM` | `CancellationToken` racine, arrêt gracieux d'axum, join du thread de capture avec délai maximal |
 | Testabilité sans matériel | Ports `FrameSource` / `FrameSourceFactory`, source synthétique |
 | Évolutivité (WebRTC, multi-caméras) | Nouveaux adaptateurs abonnés au `FrameHub` ; un hub par caméra |
@@ -51,9 +53,9 @@ src/
 │   └── source.rs        # ports FrameSource, FrameSourceFactory ; CaptureError, Recovery, SourceDescription
 ├── stream/              # CŒUR — distribution des trames et supervision
 │   ├── mod.rs
-│   ├── hub.rs           # FrameHub, FrameSubscriber, HubCapacity
+│   ├── hub.rs           # FrameHub, FrameSubscriber, DemandReceiver, HubCapacity
 │   ├── status.rs        # SourceStatus
-│   └── supervisor.rs    # CaptureSupervisor, BackoffPolicy, CaptureHandle
+│   └── supervisor.rs    # CaptureSupervisor, SupervisorSettings, BackoffPolicy, CaptureHandle
 ├── capture/             # ADAPTATEURS de source
 │   ├── mod.rs
 │   ├── factory.rs       # SourceFactory (Factory)
@@ -66,8 +68,9 @@ src/
 ├── server/              # ADAPTATEUR HTTP (axum)
 │   ├── mod.rs           # ServerBuilder, Server, ServerError
 │   ├── routes.rs        # routeur : /, /stream.mjpg, /health
-│   ├── mjpeg.rs         # corps multipart en streaming, ClientSlot (RAII)
-│   ├── health.rs        # HealthReport + client healthcheck (sous-commande)
+│   ├── mjpeg.rs         # corps multipart en streaming, permis de client (Semaphore, RAII)
+│   ├── health.rs        # HealthReport (DTO serde) + client healthcheck (sous-commande)
+│   ├── net.rs           # options de socket TCP (keepalive, TCP_USER_TIMEOUT)
 │   └── index.html       # page minimale (include_str!)
 └── config/              # lecture et validation de la configuration
     ├── mod.rs           # AppConfig, ConfigError
@@ -130,6 +133,7 @@ flowchart LR
             subgraph Runtime["Runtime tokio"]
                 Hub[("FrameHub<br/>broadcast borné")]
                 Status[("watch SourceStatus")]
+                Demand[("watch nombre d'abonnés")]
                 Router["Routeur axum"]
                 C1["Tâche client 1<br/>flux MJPEG"]
                 C2["Tâche client N<br/>flux MJPEG"]
@@ -141,7 +145,9 @@ flowchart LR
     Cam -->|"mmap V4L2"| Src
     Sup -->|"next_frame()"| Src
     Sup -->|"publish(Frame)"| Hub
-    Sup -->|"send(status)"| Status
+    Sup -->|"send_replace(status)"| Status
+    Hub -->|"subscribe et drop"| Demand
+    Demand -->|"premier client, plus de client"| Sup
     Hub --> C1
     Hub --> C2
     Status --> Health
@@ -261,12 +267,13 @@ pub enum SourceKind {
 /// Préférence de format de pixels demandée par la configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FormatPreference {
-    /// MJPEG si disponible, sinon YUYV (comportement par défaut).
+    /// MJPEG si disponible, sinon YUYV (comportement par défaut). En v1, sans
+    /// repli YUYV, équivaut à `Mjpeg`.
     #[default]
     Auto,
     /// MJPEG exigé : erreur si la webcam ne le propose pas.
     Mjpeg,
-    /// YUYV forcé (diagnostic ; coûteux en CPU).
+    /// YUYV forcé (diagnostic ; coûteux en CPU). Phase 2 : refusé en v1.
     Yuyv,
 }
 
@@ -370,8 +377,9 @@ impl CaptureError {
 ///
 /// Défini dans `domain` (et non dans `stream`) car il est renvoyé par le port
 /// `FrameSource::description` : le placer dans `stream` créerait une dépendance
-/// `domain` → `stream` interdite.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+/// `domain` → `stream` interdite. Pas de `serde` ici : la forme JSON est un DTO de
+/// `server::health` (voir § 3.6).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceDescription {
     /// Nom lisible (ex. carte de la webcam, « synthetic »).
     pub name: String,
@@ -396,9 +404,12 @@ Remarques d'implémentation :
 ### 3.4 `stream` — diffuseur, état et superviseur
 
 ```rust
-//! Cœur de distribution : publie les trames capturées vers N abonnés.
+//! Cœur de distribution : publie les trames capturées vers N abonnés et expose
+//! la demande (nombre d'abonnés) au superviseur de capture.
 
 use std::num::NonZeroUsize;
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{broadcast, watch};
 use tokio_util::sync::CancellationToken;
 
@@ -410,10 +421,14 @@ pub struct HubCapacity(NonZeroUsize);
 ///
 /// Implémente le pattern **Observer / Publish-Subscribe** au-dessus de
 /// `tokio::sync::broadcast` : l'émetteur ne bloque jamais, un abonné lent saute
-/// des trames au lieu de ralentir les autres. Cloner le hub est peu coûteux.
+/// des trames au lieu de ralentir les autres. Tient aussi le compteur d'abonnés
+/// (la « demande »), publié par `watch`, qui pilote la capture à la demande.
+/// Cloner le hub est peu coûteux.
 #[derive(Debug, Clone)]
 pub struct FrameHub {
     sender: broadcast::Sender<Frame>,
+    // `Arc` car chaque abonné doit pouvoir décrémenter le compteur dans son `Drop`.
+    demand: Arc<watch::Sender<usize>>,
 }
 
 impl FrameHub {
@@ -426,16 +441,27 @@ impl FrameHub {
     pub fn publish(&self, frame: Frame) -> usize;
 
     /// Crée un nouvel abonné qui recevra les trames publiées à partir de maintenant.
+    ///
+    /// Incrémente la demande (`send_modify`) : le superviseur est réveillé s'il
+    /// attendait un premier client.
     pub fn subscribe(&self) -> FrameSubscriber;
 
-    /// Nombre d'abonnés actuellement connectés.
+    /// Nombre d'abonnés actuellement vivants (valeur du compteur de demande).
     pub fn subscriber_count(&self) -> usize;
+
+    /// Observateur de la demande, destiné au `CaptureSupervisor`.
+    pub fn demand(&self) -> DemandReceiver;
 }
 
-/// Abonné au flux de trames ; se désabonne automatiquement à la destruction (**RAII**).
+/// Abonné au flux de trames.
+///
+/// **RAII** : sa destruction désabonne le récepteur `broadcast` **et** décrémente la
+/// demande ; c'est le seul chemin de décrément, donc le compteur ne peut pas dériver.
+/// Volontairement non `Clone`.
 #[derive(Debug)]
 pub struct FrameSubscriber {
     receiver: broadcast::Receiver<Frame>,
+    demand: Arc<watch::Sender<usize>>,
     skipped: u64,
 }
 
@@ -450,15 +476,41 @@ impl FrameSubscriber {
     pub fn skipped_frames(&self) -> u64;
 }
 
+impl Drop for FrameSubscriber {
+    /// Décrémente la demande (`send_modify` avec `saturating_sub`).
+    fn drop(&mut self);
+}
+
+/// Observateur du nombre d'abonnés du hub (**Observer**, côté superviseur).
+///
+/// Indépendant du transport : tout abonné compte, qu'il vienne du flux MJPEG ou
+/// d'un futur transport WebRTC.
+#[derive(Debug, Clone)]
+pub struct DemandReceiver {
+    receiver: watch::Receiver<usize>,
+}
+
+impl DemandReceiver {
+    /// Nombre d'abonnés courant (lecture non bloquante, utilisable entre deux trames).
+    pub fn subscriber_count(&self) -> usize;
+    /// Se résout dès qu'au moins un abonné existe (immédiatement si c'est déjà le cas).
+    pub async fn wait_for_subscribers(&mut self);
+    /// Se résout dès que plus aucun abonné n'existe.
+    pub async fn wait_for_no_subscribers(&mut self);
+}
+
 /// État observable de la capture, publié via `tokio::sync::watch`.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
+///
+/// Aucun `serde` : `/health` le convertit en DTO (`server::health::HealthReport`).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceStatus {
-    /// Ouverture initiale en cours.
+    /// Sonde de démarrage ou ouverture de la source en cours.
     Starting,
-    /// Trames en cours de production.
+    /// Aucun abonné : webcam fermée, en attente du premier client.
+    Idle,
+    /// Trames en cours de production (y compris pendant le délai de grâce).
     Streaming { source: SourceDescription },
-    /// Source perdue ; nouvelle tentative prévue.
+    /// Source perdue alors que des clients attendent ; nouvelle tentative prévue.
     Reconnecting { attempt: u32, last_error: String },
     /// Erreur fatale : l'application va s'arrêter.
     Failed { reason: String },
@@ -478,29 +530,46 @@ impl BackoffPolicy {
     pub fn delay(&self, attempt: u32) -> Duration;
 }
 
-/// Superviseur de capture : boucle de lecture, reconnexion, publication.
+/// Réglages du superviseur, regroupés pour garder un constructeur lisible.
+#[derive(Debug, Clone, Copy)]
+pub struct SupervisorSettings {
+    /// Attente entre deux tentatives de reconnexion.
+    pub backoff: BackoffPolicy,
+    /// Délai de grâce avant d'éteindre la webcam après le départ du dernier client
+    /// (`Duration::ZERO` : arrêt immédiat).
+    pub idle_timeout: Duration,
+}
+
+/// Superviseur de capture : capture à la demande, boucle de lecture, reconnexion.
 ///
 /// S'exécute dans un **thread OS dédié** car `FrameSource::next_frame` est bloquant.
 /// Dépend uniquement des ports `FrameSourceFactory` / `FrameSource` (inversion de
-/// dépendances) : il ignore tout de V4L2.
+/// dépendances) : il ignore tout de V4L2 et du transport HTTP.
 pub struct CaptureSupervisor {
     factory: Box<dyn FrameSourceFactory>,
     hub: FrameHub,
+    demand: DemandReceiver,
     status: watch::Sender<SourceStatus>,
-    backoff: BackoffPolicy,
+    settings: SupervisorSettings,
+    // Permet des attentes interruptibles (`block_on` + `select!`) depuis le thread
+    // de capture, qui n'est pas un thread du runtime.
+    runtime: tokio::runtime::Handle,
     cancel: CancellationToken,
 }
 
 impl CaptureSupervisor {
     /// Construit le superviseur (injection des dépendances par le constructeur).
+    ///
+    /// La demande est obtenue par `hub.demand()`.
     pub fn new(
         factory: Box<dyn FrameSourceFactory>,
         hub: FrameHub,
-        backoff: BackoffPolicy,
+        settings: SupervisorSettings,
+        runtime: tokio::runtime::Handle,
         cancel: CancellationToken,
     ) -> Self;
 
-    /// Récepteur de l'état de la source (pour `/health` et les logs).
+    /// Récepteur de l'état de la source (pour `/health`, les logs et `main`).
     pub fn status(&self) -> watch::Receiver<SourceStatus>;
 
     /// Démarre la boucle dans le thread `camstream-capture`.
@@ -520,6 +589,38 @@ impl CaptureHandle {
 }
 ```
 
+Boucle du superviseur (pseudo-code, détail dans le § 7) :
+
+```text
+statut = Starting
+sonde : source = factory.create()
+    Fatal  -> statut Failed, fin du thread avec l'erreur
+    Reopen -> warn, source = aucune
+    Ok     -> drop(source)                      # webcam rendue tout de suite
+boucle :
+    statut = Idle
+    attendre(premier abonné | jeton)            # block_on + select!
+    tentative = 0
+    boucle d'ouverture :
+        statut = Starting ; créer la source
+        Ok    -> boucle de lecture (ci-dessous)
+        Reopen-> tentative += 1 ; statut Reconnecting
+                 attendre(backoff.delay(tentative) | plus d'abonné | jeton)
+                 plus d'abonné -> retour à Idle
+        Fatal -> statut Failed, fin
+    boucle de lecture :
+        next_frame() -> publish ; tentative = 0 ; statut Streaming
+        si demande == 0 : démarrer l'échéance de grâce (si pas déjà fait)
+        si demande > 0  : annuler l'échéance
+        échéance dépassée -> drop(source), retour à Idle
+        erreur Skip -> ignorer ; erreur Reopen -> drop(source), boucle d'ouverture
+jeton annulé à tout moment -> drop(source), statut Stopped, fin
+```
+
+Pendant la lecture, la demande est lue sans attente (`subscriber_count()`) entre deux trames ;
+l'échéance de grâce est donc vérifiée au rythme des trames (≤ `read_timeout`), précision
+largement suffisante pour un délai de 10 s.
+
 Remarques d'implémentation (API réelles de `tokio` / `std`) :
 
 - `broadcast::channel(n)` panique si `n == 0` (d'où `HubCapacity`) et **arrondit `n` à la
@@ -529,7 +630,31 @@ Remarques d'implémentation (API réelles de `tokio` / `std`) :
   (*cancel-safe*), donc utilisable dans `tokio::select!`.
 - `watch::Sender::send` échoue **sans mémoriser la valeur** quand aucun récepteur n'existe :
   le superviseur doit utiliser `send_replace` (ou `send_modify`) pour que `/health` lise
-  toujours l'état courant.
+  toujours l'état courant ; de même, le compteur de demande est modifié par `send_modify`,
+  qui s'applique sans condition.
+- `Handle::block_on` panique s'il est appelé **depuis** un contexte asynchrone ; il est
+  valide ici car le thread `camstream-capture` est un thread OS ordinaire. Les minuteries
+  (`tokio::time::sleep`) attendues ainsi utilisent le pilote de temps du runtime, ce qui
+  impose deux précautions documentées par tokio :
+  - sur un runtime **`current_thread`**, `Handle::block_on` ne fait pas avancer les pilotes
+    d'E/S et de temps : minuteries et réveils ne fonctionnent que si un autre thread est en
+    train d'exécuter `Runtime::block_on`. `#[tokio::main]` est multi-thread, mais
+    `#[tokio::test]` est `current_thread` par défaut : les tests du superviseur doivent
+    utiliser `#[tokio::test(flavor = "multi_thread")]` et ne jamais bloquer le thread de test
+    (pas de `CaptureHandle::join` synchrone dans le test) ;
+  - si le runtime est arrêté pendant qu'une minuterie est attendue via `Handle::block_on`,
+    celle-ci **panique**. Cas possible si le join borné du thread de capture expire et que
+    `main` se termine : sans conséquence (le processus sort), mais à ne pas confondre avec un
+    défaut dans les logs.
+- `watch::Receiver::wait_for(f)` renvoie un `watch::Ref`, c'est-à-dire un **verrou de
+  lecture** (non `Send`) : le relâcher immédiatement (`.map(|_| ())`), ne jamais le garder à
+  travers un `.await`. Il examine la valeur courante avant d'attendre, même si l'émetteur est
+  déjà détruit : un `Failed` publié juste avant la fin du thread est donc bien vu. En revanche,
+  si le thread se termine **sans** publier `Failed` (panique, par exemple dans le `Drop` de
+  `v4l`), `wait_for` renvoie `Err(RecvError)` : `main` doit traiter ce cas comme une fin
+  anormale de la capture.
+- `watch::Sender<T>` est `Clone` (vérifié dans tokio 1.54) : l'`Arc` autour du compteur de demande est
+  donc facultatif ; un clone du `Sender` dans chaque `FrameSubscriber` suffit.
 - `std::thread::JoinHandle::join` est **bloquant et sans délai maximal** : `CaptureHandle::join`
   ne doit pas être appelé directement depuis une tâche async. `app` l'appelle via
   `tokio::task::spawn_blocking`, enveloppé dans `tokio::time::timeout(shutdown_timeout, …)`.
@@ -624,9 +749,11 @@ impl FrameSource for V4l2Source {
 >   octets parasites et pèse la taille du tampon.
 > - **Reprise après délai** : `next()` remet en file (`QBUF`) le tampon précédent *avant* le
 >   `poll`. Après un `TimedOut`, l'appel suivant remet en file un tampon déjà en file
->   (`EINVAL` attendu). La politique « `Timeout` → `Skip` » du § 6 ne fonctionne donc pas telle
->   quelle avec `v4l` 0.14 : traiter `Timeout` comme `Reopen` dans l'adaptateur V4L2, ou
->   contourner dans `V4l2Source` (à trancher pendant le spike).
+>   (`EINVAL` attendu). **Décision** : `Timeout` est classé `Reopen` (voir § 6). Un délai de
+>   2 s à 15 i/s signifie une webcam figée, pour laquelle recréer la source est la bonne
+>   réaction ; la reconnexion est de toute façon un chemin courant avec la capture à la
+>   demande. Le contournement (réimplémenter la boucle `DQBUF`/`QBUF` ou corriger `v4l`) est
+>   écarté : code bas niveau ou fork à maintenir pour un cas rare.
 > - **`Drop`** : le `Drop` du flux panique si `STREAMOFF` échoue avec une erreur autre que
 >   `ENODEV` (voir les remarques du § 3.4 sur `join`).
 > - `Device::with_path` ouvre en `O_RDWR | O_NONBLOCK` ; le format se négocie par le trait
@@ -645,7 +772,8 @@ pub struct MaxClients(NonZeroUsize);
 /// Construit le serveur HTTP étape par étape.
 ///
 /// Implémente le pattern **Builder** : paramètres obligatoires (adresse, hub,
-/// état, jeton d'arrêt) vérifiés par `build`, paramètres optionnels avec défauts.
+/// état, jeton d'arrêt) vérifiés par `build`, paramètres optionnels avec défauts
+/// (`MaxClients`, options TCP).
 #[derive(Debug)]
 pub struct ServerBuilder { /* champs optionnels */ }
 
@@ -658,6 +786,8 @@ impl ServerBuilder {
     pub fn status(self, status: watch::Receiver<SourceStatus>) -> Self;
     /// Limite de clients simultanés (défaut : 10).
     pub fn max_clients(self, max: MaxClients) -> Self;
+    /// Détection des clients disparus (défaut : keepalive 30 s, `TCP_USER_TIMEOUT` 30 s).
+    pub fn tcp_options(self, options: TcpOptions) -> Self;
     /// Jeton déclenchant l'arrêt gracieux (fin des flux en cours).
     pub fn shutdown(self, token: CancellationToken) -> Self;
     /// Valide et construit le serveur.
@@ -674,8 +804,72 @@ impl Server {
     pub async fn run(self) -> Result<(), ServerError>;
 }
 
-/// Place de client réservée ; libérée automatiquement à la déconnexion (**RAII**).
-struct ClientSlot { /* compteur partagé */ }
+/// Limiteur de clients de flux : `MaxClients` permis.
+///
+/// `try_acquire_owned` réserve une place sans attente (échec → `503`) ; le
+/// `OwnedSemaphorePermit` renvoyé est stocké dans l'état du corps MJPEG et libère la
+/// place à sa destruction (**RAII**), même en cas de coupure brutale.
+#[derive(Debug, Clone)]
+struct ClientLimiter {
+    semaphore: Arc<tokio::sync::Semaphore>,
+    max: MaxClients,
+}
+
+impl ClientLimiter {
+    /// Réserve une place ; `None` si la limite est atteinte.
+    fn try_acquire(&self) -> Option<tokio::sync::OwnedSemaphorePermit>;
+    /// Nombre de clients en cours (`max - available_permits()`), pour `/health`.
+    fn active(&self) -> usize;
+}
+
+/// Options appliquées à chaque socket acceptée (via `socket2::SockRef`).
+#[derive(Debug, Clone, Copy)]
+pub struct TcpOptions {
+    /// Inactivité avant la première sonde keepalive.
+    pub keepalive_idle: Duration,
+    /// Intervalle entre sondes keepalive.
+    pub keepalive_interval: Duration,
+    /// Nombre de sondes keepalive sans réponse avant fermeture (`TCP_KEEPCNT`).
+    pub keepalive_retries: u32,
+    /// Durée maximale de données non acquittées avant fermeture par le noyau
+    /// (`TCP_USER_TIMEOUT`, Linux).
+    pub user_timeout: Duration,
+}
+
+/// Représentation JSON de `/health` (DTO de l'adaptateur HTTP).
+///
+/// Découple le contrat JSON des types du cœur, qui restent sans `serde`.
+#[derive(Debug, serde::Serialize)]
+pub struct HealthReport {
+    /// `"ok"` ou `"failed"`.
+    pub status: &'static str,
+    /// État de la caméra (`state` : `starting`, `idle`, `streaming`, `reconnecting`,
+    /// `failed`, `stopped`, plus les détails utiles).
+    pub camera: CameraReport,
+    /// Clients de flux connectés.
+    pub clients: usize,
+}
+
+/// État de la caméra tel qu'exposé en JSON.
+#[derive(Debug, serde::Serialize)]
+pub struct CameraReport {
+    /// Nom d'état stable en `snake_case`.
+    pub state: &'static str,
+    /// Paramètres négociés, présents en `streaming`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<SourceReport>,
+    /// Dernière erreur, présente en `reconnecting` et `failed`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// DTO de `SourceDescription` (nom, format, `"640x480"`, cadence).
+#[derive(Debug, serde::Serialize)]
+pub struct SourceReport { /* name, pixel_format, resolution, fps */ }
+
+/// Correspondance explicite cœur → JSON : renommer une variante du cœur ne change
+/// pas le contrat JSON sans modification visible ici.
+impl From<&SourceStatus> for CameraReport { /* ... */ }
 
 /// Erreurs du serveur HTTP.
 #[derive(Debug, thiserror::Error)]
@@ -696,9 +890,9 @@ Routes :
 
 | Route | Réponse |
 |---|---|
-| `GET /` | Page HTML minimale (`<img src="/stream.mjpg">`, quelques lignes de JS pour recharger l'image si la connexion tombe) |
+| `GET /` | Page HTML minimale (`<img src="/stream.mjpg">`, texte « Démarrage de la caméra… » jusqu'au premier `onload`, quelques lignes de JS pour recharger l'image si la connexion tombe) |
 | `GET /stream.mjpg` | `200`, `multipart/x-mixed-replace; boundary=frame`, corps infini ; `503` si `MaxClients` atteint |
-| `GET /health` | JSON `{"status":"ok","camera":{...SourceStatus...},"clients":N}` ; `200` sauf `Failed` → `503` |
+| `GET /health` | JSON `HealthReport`, ex. `{"status":"ok","camera":{"state":"idle"},"clients":0}` ; `200` dans tous les états sauf `failed` → `503` |
 | autre | `404` |
 
 Format d'une partie MJPEG (deux `Bytes` émis successivement, sans copie du JPEG) :
@@ -718,8 +912,38 @@ initial de la toute première partie est un préambule vide, ignoré par les nav
 
 Le corps est construit avec `axum::body::Body::from_stream`, qui exige un flux
 `Send + 'static` dont l'erreur implémente `Into<BoxError>` : l'état du flux possède le
-`FrameSubscriber`, le `ClientSlot` et un clone du `CancellationToken` (attente via
-`cancelled_owned()` ou clone par itération, `cancelled()` empruntant le jeton).
+`FrameSubscriber`, le permis `OwnedSemaphorePermit` et un clone du `CancellationToken`
+(attente via `cancelled_owned()` ou clone par itération, `cancelled()` empruntant le jeton).
+
+Ordre dans le handler `/stream.mjpg` : (1) `try_acquire` du permis, sinon `503` ;
+(2) `hub.subscribe()` — la demande devient visible et réveille le superviseur ;
+(3) réponse `200` immédiate avec les en-têtes multipart ; (4) les parties suivent dès que la
+webcam produit ([ADR 0006](adr/0006-capture-a-la-demande.md)). Le handler n'attend jamais la
+première trame.
+
+Options TCP : `axum::serve` accepte un `Listener` ; les options sont appliquées à chaque
+connexion acceptée par `axum::serve::ListenerExt::tap_io` (vérifié dans axum 0.8.9 :
+`fn tap_io<F>(self, tap_fn: F) -> TapIo<Self, F> where F: FnMut(&mut Self::Io) + Send + 'static`,
+appelé sur le **listener**, pas sur `Serve`) :
+
+```rust
+use axum::serve::ListenerExt;
+
+let listener = tokio::net::TcpListener::bind(addr).await?.tap_io(move |stream| {
+    // Erreur non fatale : la connexion reste servie sans les options.
+    if let Err(err) = net::apply_tcp_options(socket2::SockRef::from(&*stream), &options) {
+        tracing::debug!(%err, "cannot set TCP options on accepted connection");
+    }
+});
+axum::serve(listener, router).with_graceful_shutdown(token.cancelled_owned()).await
+```
+
+Avec `socket2` 0.6 : `SockRef::set_tcp_keepalive(&TcpKeepalive::new().with_time(..)
+.with_interval(..).with_retries(..))` et `SockRef::set_tcp_user_timeout(Some(..))`.
+`with_retries` et `set_tcp_user_timeout` n'existent qu'avec la feature **`all`** de `socket2`
+(et, pour le second, sous Linux/Android/Fuchsia), ce qui convient à la cible. `TCP_NODELAY`
+(`stream.set_nodelay(true)`) peut être appliqué au même endroit pour réduire la latence des
+parties.
 
 ### 3.7 `config`
 
@@ -744,6 +968,8 @@ pub struct AppConfig {
     pub reconnect_initial: Duration,
     /// Attente maximale entre deux tentatives de reconnexion.
     pub reconnect_max: Duration,
+    /// Délai de grâce avant d'éteindre la webcam sans client (capture à la demande).
+    pub idle_timeout: Duration,
     /// Délai maximal accordé à l'arrêt gracieux.
     pub shutdown_timeout: Duration,
 }
@@ -776,7 +1002,9 @@ dériver `clap::ValueEnum` : soit `domain` implémente `FromStr` (clap l'utilise
 analyseur de valeur), soit `config` déclare ses propres enums miroirs et les convertit. À noter
 aussi : `try_parse_from` lit quand même les variables `CAMSTREAM_*` du processus (feature
 `env`) ; les tests de configuration doivent en tenir compte. C'est
-`app` qui convertit `AppConfig` en `HubCapacity`, `BackoffPolicy`, `MaxClients`. La liste des
+`app` qui convertit `AppConfig` en `HubCapacity`, `SupervisorSettings`, `MaxClients`.
+L'adresse d'écoute par défaut est `127.0.0.1:8080` ; l'image Docker fixe
+`CAMSTREAM_BIND=0.0.0.0` ([ADR 0007](adr/0007-securite-reseau-local-v1.md)). La liste des
 variables et leurs défauts figure dans [deploiement.md](deploiement.md#5-variables-denvironnement).
 
 ## 4. Diagramme de classes
@@ -814,28 +1042,45 @@ classDiagram
     }
     class FrameHub {
         -sender broadcast_Sender
+        -demand ArcWatchSender
         +new(capacity) FrameHub
         +publish(frame) usize
         +subscribe() FrameSubscriber
         +subscriber_count() usize
+        +demand() DemandReceiver
     }
     class FrameSubscriber {
         -receiver broadcast_Receiver
+        -demand ArcWatchSender
         -skipped u64
         +next_frame() Option~Frame~
         +skipped_frames() u64
+        +drop()
+    }
+    class DemandReceiver {
+        -receiver watch_Receiver
+        +subscriber_count() usize
+        +wait_for_subscribers()
+        +wait_for_no_subscribers()
     }
     class CaptureSupervisor {
         -factory BoxFrameSourceFactory
         -hub FrameHub
-        -backoff BackoffPolicy
+        -demand DemandReceiver
+        -settings SupervisorSettings
+        -runtime Handle
         -cancel CancellationToken
         +status() watch_Receiver
         +spawn() CaptureHandle
     }
+    class SupervisorSettings {
+        +backoff BackoffPolicy
+        +idle_timeout Duration
+    }
     class SourceStatus {
         <<enumeration>>
         Starting
+        Idle
         Streaming
         Reconnecting
         Failed
@@ -864,8 +1109,20 @@ classDiagram
         +hub(hub) ServerBuilder
         +status(rx) ServerBuilder
         +max_clients(max) ServerBuilder
+        +tcp_options(options) ServerBuilder
         +shutdown(token) ServerBuilder
         +build() Result~Server~
+    }
+    class ClientLimiter {
+        -semaphore ArcSemaphore
+        +try_acquire() Option~OwnedSemaphorePermit~
+        +active() usize
+    }
+    class HealthReport {
+        <<DTO serde>>
+        +status str
+        +camera CameraReport
+        +clients usize
     }
 
     FrameSource <|.. V4l2Source : implémente
@@ -877,6 +1134,9 @@ classDiagram
     CaptureSupervisor o-- FrameSourceFactory
     CaptureSupervisor --> FrameHub : publie
     CaptureSupervisor --> SourceStatus : publie
+    CaptureSupervisor --> DemandReceiver : observe
+    CaptureSupervisor *-- SupervisorSettings
+    FrameHub ..> DemandReceiver : crée
     CaptureSupervisor ..> FrameSource : utilise
     FrameSource ..> Frame : produit
     FrameSource ..> CaptureError : échoue avec
@@ -885,6 +1145,9 @@ classDiagram
     ServerBuilder ..> Server : construit
     Server --> FrameHub : s'abonne
     Server --> SourceStatus : lit
+    Server *-- ClientLimiter
+    Server ..> HealthReport : sérialise
+    HealthReport ..> SourceStatus : From
 ```
 
 ## 5. Flux de données et séquences
@@ -919,12 +1182,24 @@ sequenceDiagram
     Main->>Main: init tracing et CancellationToken racine
     Main->>App: App::from_config(config, token)
     App->>App: créer FrameHub et SourceFactory
-    App->>Sup: new(factory, hub, backoff, token enfant)
+    App->>Sup: new(factory, hub, settings, Handle, token enfant)
     App->>Srv: ServerBuilder ... build()
     Main->>Sup: spawn() dans le thread camstream-capture
+    Sup->>Sup: sonde, créer puis détruire la source
+    alt erreur Fatal
+        Sup-->>Main: statut Failed
+        Main->>Main: annuler le jeton racine, sortie code 1
+    else sonde réussie ou webcam absente
+        Sup-->>Main: statut Idle
+    end
     Main->>Srv: run() sur le runtime tokio
-    Main->>Main: attendre SIGTERM ou SIGINT ou fin anormale
+    Main->>Main: select sur SIGTERM, SIGINT, fin du serveur, statut Failed
 ```
+
+Le `select!` final de `main` est le **seul** endroit qui décide de l'arrêt global : sur
+`Failed` (observé par `status.wait_for`), il annule le jeton racine puis suit la séquence
+du § 5.4 et sort en code 1 ([ADR 0004](adr/0004-distribution-des-trames-et-concurrence.md),
+décision 5).
 
 ### 5.3 Connexion d'un client et streaming
 
@@ -942,7 +1217,7 @@ sequenceDiagram
     R-->>B: 200 page HTML avec img src=/stream.mjpg
     B->>R: GET /stream.mjpg
     R->>M: requête
-    M->>M: réserver un ClientSlot
+    M->>M: try_acquire_owned sur le Semaphore
     alt limite MaxClients atteinte
         M-->>B: 503 Service Unavailable
     else place disponible
@@ -961,7 +1236,7 @@ sequenceDiagram
             M->>M: compter n trames sautées et continuer
         end
         B-xM: fermeture de l'onglet
-        M->>M: destruction du flux, du FrameSubscriber et du ClientSlot
+        M->>M: destruction du flux, du FrameSubscriber et du permis
     end
 ```
 
@@ -1001,6 +1276,58 @@ pleine, client disparu sans `RST`), hyper ne sonde plus le flux du corps et le j
 jamais observé. Le futur `Server::run` doit donc lui aussi être borné par
 `tokio::time::timeout(shutdown_timeout, …)` dans `app`, au même titre que le join du thread de
 capture.
+Les options `SO_KEEPALIVE` / `TCP_USER_TIMEOUT` (§ 3.6) réduisent ce cas en fonctionnement
+normal : un client disparu est déconnecté par le noyau au bout d'environ 30 s.
+
+### 5.5 Capture à la demande : premier client, rechargement, dernier départ
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant B as Navigateur
+    participant M as Handler MJPEG
+    participant H as FrameHub
+    participant D as DemandReceiver
+    participant S as CaptureSupervisor
+    participant F as SourceFactory
+    participant V as V4l2Source
+
+    Note over S: statut Idle, webcam fermée
+    S->>D: block_on wait_for_subscribers ou jeton
+    B->>M: GET /stream.mjpg
+    M->>M: permis du Semaphore
+    M->>H: subscribe()
+    H->>D: demande 0 vers 1
+    M-->>B: 200 et en-têtes multipart, sans attendre
+    D-->>S: réveil, au moins un abonné
+    S->>F: create()
+    F->>V: open, configure, start_streaming
+    F-->>S: source prête, statut Streaming
+    loop tant que la demande est non nulle
+        S->>V: next_frame()
+        V-->>S: Frame
+        S->>H: publish(frame)
+        H-->>M: trame
+        M-->>B: partie JPEG
+    end
+    B-xM: rechargement de la page
+    M->>H: drop du FrameSubscriber, demande 1 vers 0
+    S->>S: demande nulle, échéance de grâce dans idle_timeout
+    B->>M: nouveau GET /stream.mjpg avant l'échéance
+    M->>H: subscribe(), demande 0 vers 1
+    S->>S: échéance annulée, la webcam reste ouverte
+    Note over B,M: première image immédiate
+    B-xM: fermeture de l'onglet
+    M->>H: drop, demande 1 vers 0
+    S->>S: échéance atteinte sans nouvel abonné
+    S->>V: drop donc STREAMOFF et fermeture
+    Note over S: statut Idle
+```
+
+Latence du premier client : ouverture et première trame (≈ 0,3 à 1,5 s selon la webcam)
+pendant lesquelles la connexion est ouverte mais sans image ; la page HTML affiche
+« Démarrage de la caméra… » jusqu'au premier `onload` de l'image. Les spectateurs suivants,
+et les rechargements dans le délai de grâce, ne subissent pas cette latence.
 
 ## 6. Gestion des erreurs
 
@@ -1017,9 +1344,9 @@ Politique de reprise de la capture :
 | `CaptureError` | `Recovery` | Comportement |
 |---|---|---|
 | `CorruptedFrame` | `Skip` | Trame jetée, log `debug` |
-| `Timeout` | `Skip` puis `Reopen` | Après 3 délais consécutifs, la source est recréée (webcam figée) |
-| `Disconnected`, `DeviceNotFound`, `Io` | `Reopen` | Statut `Reconnecting`, attente exponentielle (1 s, 2 s, 4 s… max 30 s), nouvel appel à la fabrique |
-| `PermissionDenied`, `UnsupportedFormat` | `Fatal` | Statut `Failed`, fin du thread de capture avec l'erreur ; `main` l'observe (statut `watch` ou fin du thread) et annule le jeton racine, sortie code 1 (la politique `restart` de Docker prend le relais) |
+| `Timeout` | `Reopen` | Webcam figée : la source est détruite puis recréée (choix lié au comportement de `v4l` 0.14, § 3.5) |
+| `Disconnected`, `DeviceNotFound`, `Io` | `Reopen` | Statut `Reconnecting`, attente exponentielle (1 s, 2 s, 4 s… max 30 s), nouvel appel à la fabrique — **uniquement tant qu'il y a des abonnés** ; sinon `Idle` |
+| `PermissionDenied`, `UnsupportedFormat` (dont « pas de MJPEG » en v1) | `Fatal` | Statut `Failed`, fin du thread de capture avec l'erreur ; `main` l'observe (statut `watch` ou fin du thread) et annule le jeton racine, sortie code 1 (la politique `restart` de Docker prend le relais) |
 
 Le superviseur reçoit un jeton **enfant** (§ 5.2) : annuler un `child_token()` n'annule pas
 son parent. Le superviseur ne peut donc pas déclencher lui-même l'arrêt global ; c'est `main`
@@ -1028,23 +1355,33 @@ qui réagit à `Failed`.
 Aucun `unwrap()`/`expect()` hors tests ; les invariants (ex. constantes non nulles) passent
 par des constructeurs `const` ou sont commentés.
 
-## 7. Cycle de vie de la capture et reconnexion
+## 7. Cycle de vie de la capture, capture à la demande et reconnexion
 
 ```mermaid
 stateDiagram-v2
     [*] --> Starting
-    Starting --> Streaming : factory.create() réussi
-    Starting --> Reconnecting : erreur Reopen
+    Starting --> Idle : sonde réussie ou webcam absente, aucun abonné
+    Starting --> Streaming : source créée et abonnés présents
+    Starting --> Reconnecting : erreur Reopen avec abonnés
     Starting --> Failed : erreur Fatal
 
-    Streaming --> Streaming : trame publiée ou erreur Skip
-    Streaming --> Reconnecting : erreur Reopen ou délais répétés
+    Idle --> Starting : premier abonné
+
+    state Streaming {
+        [*] --> Active
+        Active --> Grace : demande à 0
+        Grace --> Active : nouvel abonné avant l'échéance
+    }
+    Streaming --> Idle : échéance de grâce atteinte, source détruite
+    Streaming --> Reconnecting : erreur Reopen, dont Timeout
     Streaming --> Failed : erreur Fatal
 
-    Reconnecting --> Streaming : factory.create() réussi après attente
+    Reconnecting --> Streaming : create() réussi après attente
     Reconnecting --> Reconnecting : nouvel échec, attente doublée
+    Reconnecting --> Idle : plus aucun abonné
     Reconnecting --> Failed : erreur Fatal
 
+    Idle --> Stopped : jeton annulé
     Starting --> Stopped : jeton annulé
     Streaming --> Stopped : jeton annulé
     Reconnecting --> Stopped : jeton annulé pendant l'attente
@@ -1052,16 +1389,25 @@ stateDiagram-v2
     Stopped --> [*]
 ```
 
+`Active` et `Grace` sont des sous-états internes du superviseur ; l'état publié reste
+`Streaming` dans les deux cas (la webcam est ouverte). `Starting` couvre la sonde initiale et
+chaque ouverture déclenchée par un premier abonné.
+
 Règles :
 
 - l'attente de reconnexion est **interruptible** par le jeton (pas de `thread::sleep` de 30 s
-  qui retarderait l'arrêt). `CancellationToken` n'offre **aucune attente synchrone** (seulement
-  `is_cancelled()` et le futur `cancelled()`) : depuis le thread de capture, attendre par
-  tranches courtes (ex. 100 ms) en testant `is_cancelled()`, ou utiliser
-  `tokio::runtime::Handle::block_on` sur un `select!` entre `cancelled()` et
-  `tokio::time::sleep` (le `Handle` est alors injecté au superviseur) ;
+  qui retarderait l'arrêt). `CancellationToken` n'offre **aucune attente synchrone** : la
+  solution retenue est `tokio::runtime::Handle::block_on` sur un `select!` entre
+  `cancelled()`, la demande et `tokio::time::sleep` (le `Handle` est injecté au superviseur,
+  [ADR 0006](adr/0006-capture-a-la-demande.md)) ;
+- toutes les attentes du thread de capture (premier abonné, attente exponentielle) sont des
+  `Handle::block_on` sur un `select!` (jeton, demande, minuterie) : aucune attente active ;
 - pendant `Reconnecting`, les clients restent connectés : ils ne reçoivent plus de trames,
   puis le flux reprend sur la **même connexion** quand la webcam revient ;
+- l'attente exponentielle est interrompue si la demande tombe à 0 (→ `Idle`, tentatives
+  remises à zéro) ; depuis `Idle`, la première tentative au retour d'un abonné est immédiate ;
+- sans abonné, la webcam n'est pas surveillée : un débranchement n'est détecté qu'au client
+  suivant ;
 - l'ancienne source est détruite (RAII) **avant** la tentative suivante, pour libérer le
   périphérique ;
 - le compteur de tentatives est remis à zéro dès qu'une trame est publiée.
@@ -1073,15 +1419,15 @@ conteneur après rebranchement (voir [deploiement.md](deploiement.md#7-reconnexi
 
 | Activité | Exécution | Communication |
 |---|---|---|
-| Lecture V4L2 et reconnexion | Thread OS `camstream-capture` | `FrameHub::publish` (synchrone), `watch::Sender::send_replace` |
+| Lecture V4L2, reconnexion, capture à la demande | Thread OS `camstream-capture` | `FrameHub::publish` (synchrone), `watch::Sender::send_replace`, `DemandReceiver` ; attentes via `Handle::block_on` |
 | Serveur HTTP et flux clients | Runtime tokio multi-thread (une tâche par connexion) | `FrameSubscriber::next_frame().await` |
 | Signaux | Tâche tokio (`tokio::signal::unix`) | `CancellationToken::cancel()` |
 
 - Aucun verrou partagé entre capture et clients : uniquement des canaux (`broadcast`, `watch`).
-- Compteur de clients : `Arc<AtomicUsize>` encapsulé dans `ClientSlot` (opération atomique,
-  pas de verrou). La réservation doit être un test-et-incrément atomique (`fetch_update` /
-  `compare_exchange`), pas un `load` suivi d'un `fetch_add`, sinon deux connexions simultanées
-  peuvent dépasser `MaxClients`.
+- Limite de clients : `Arc<Semaphore>` et `try_acquire_owned()` (ADR 0004, décision 6) ;
+  réservation atomique par construction, libération par `Drop` du permis.
+- Demande (capture à la demande) : `watch<usize>` du `FrameHub`, incrémenté dans `subscribe`,
+  décrémenté dans `Drop for FrameSubscriber`, observé par le superviseur.
 - Threads du runtime : `worker_threads` laissé au défaut (nombre de cœurs du Pi) ; à réduire à 2
   si les mesures montrent une contention avec la capture.
 
@@ -1100,6 +1446,8 @@ et la cadence (10 à 15 i/s).
 - Un *span* par client (`client_id`, adresse distante) : `info` à la connexion et à la
   déconnexion (durée, trames envoyées, trames sautées).
 - `warn` à chaque perte de webcam et tentative de reconnexion, `info` au rétablissement.
+- `info` à l'allumage et à l'extinction de la webcam (capture à la demande), avec la durée
+  d'ouverture mesurée (latence du premier client).
 - Aucune trace par trame au-dessus du niveau `trace`.
 
 ## 10. Évolutions prévues (non implémentées)
@@ -1108,6 +1456,6 @@ et la cadence (10 à 15 i/s).
 |---|---|
 | WebSocket / WebRTC | Nouvel adaptateur de transport abonné au `FrameHub` ; ADR dédié |
 | Plusieurs caméras | Un couple `CaptureSupervisor` + `FrameHub` par caméra, routes `/cameras/{id}/stream.mjpg` |
-| Capture à la demande (aucun client → webcam en pause) | Le superviseur observe `subscriber_count()` ; à décider (voir points ouverts) |
 | `/snapshot.jpg` | Nécessite de conserver la dernière trame (un `watch<Option<Frame>>` en plus du hub) |
-| Authentification / TLS | Déléguée à un reverse proxy en amont |
+| Authentification / TLS | Hors v1 ([ADR 0007](adr/0007-securite-reseau-local-v1.md)) : reverse proxy en amont ou VPN, nouvel ADR |
+| Conversion YUYV → JPEG | Phase 2 (feature `yuyv`) ; en v1, webcam sans MJPEG = erreur fatale explicite |

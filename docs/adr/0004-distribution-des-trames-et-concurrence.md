@@ -46,10 +46,37 @@
      incrémente un compteur de trames sautées et **continue** avec la trame suivante
      disponible ; il ne coupe pas le client ;
    - `publish` avec 0 abonné n'est pas une erreur (la capture continue, la trame est jetée).
-3. **État de la source par `tokio::sync::watch<SourceStatus>`** (`Starting`, `Streaming`,
-   `Reconnecting`, `Failed`, `Stopped`), lu par `/health` et par les logs.
+3. **État de la source par `tokio::sync::watch<SourceStatus>`** (`Starting`, `Idle`,
+   `Streaming`, `Reconnecting`, `Failed`, `Stopped`), lu par `/health` et par les logs.
+   L'état `Idle` et le signal de demande (nombre d'abonnés) sont introduits par
+   l'[ADR 0006](0006-capture-a-la-demande.md).
 4. **Arrêt coordonné par `tokio_util::sync::CancellationToken`** : un seul jeton racine,
    des enfants pour le serveur et la capture.
+5. **Erreur fatale de capture remontée par l'état, pas par le jeton.** Le superviseur reçoit
+   un jeton *enfant* (annuler un enfant n'annule pas le parent) et ne connaît pas le cycle de
+   vie global : sur erreur `Fatal`, il publie `Failed` et termine son thread. `main` attend,
+   dans son `select!` principal, `SIGTERM`/`SIGINT`, la fin du serveur **ou**
+   `status.wait_for(Failed)` ; dans ce dernier cas il annule le jeton racine et sort en code 1.
+   Écarté : donner le jeton racine au superviseur (il pourrait arrêter toute l'application,
+   couplage du cœur au cycle de vie applicatif) ; canal `oneshot` dédié (doublon de `watch`).
+6. **Limite de clients par `tokio::sync::Semaphore`** (`MaxClients` permis) dans `server` :
+   `Arc<Semaphore>::try_acquire_owned()` réserve une place sans attente (échec → `503`) et
+   renvoie un `OwnedSemaphorePermit` libéré à la destruction (**RAII**). Remplace le compteur
+   `AtomicUsize` + `compare_exchange` de la première version : même coût, aucune course
+   possible par construction, aucun code de synchronisation maison. Le nombre de clients
+   exposé par `/health` vaut `max - available_permits()`.
+7. **Clients bloqués en écriture TCP.** Un client lent mais vivant ne bloque personne (il
+   saute des trames) ; un client **disparu sans `RST`** (Wi-Fi coupé, téléphone en veille)
+   bloquerait en revanche son écriture indéfiniment, garderait sa place et, avec la capture à
+   la demande, maintiendrait la webcam allumée. Décision : sur chaque socket acceptée (via
+   `axum::serve::ListenerExt::tap_io` appliqué au `TcpListener` avant `axum::serve`, et
+   `socket2::SockRef`), activer `SO_KEEPALIVE`
+   (inactivité 30 s, intervalle 10 s, 3 sondes) et `TCP_USER_TIMEOUT` = 30 s : le noyau
+   ferme la connexion si des données restent non acquittées 30 s, hyper détruit alors le
+   corps (désabonnement, libération du permis). Écarté : délai d'écriture applicatif par
+   trame (nécessite un chien de garde par connexion, hyper ne sondant plus le corps quand
+   l'écriture est bloquée). L'arrêt global reste borné par `shutdown_timeout`
+   (voir [architecture](../architecture.md#54-arrêt-propre-sigterm)).
 
 `watch` reste une alternative valable pour les trames (sémantique « dernière image ») : si les
 mesures sur Pi montrent une latence ou une mémoire excessive avec `broadcast`, le remplacement

@@ -5,7 +5,9 @@
 
 ## Contexte
 
-- Cible : Raspberry Pi sous OS 64 bits (`linux/arm64`) ; ARMv7 (`linux/arm/v7`) éventuel.
+- Cible **unique** : Raspberry Pi sous Raspberry Pi OS 64 bits (`linux/arm64`). Les OS 32 bits
+  (`linux/arm/v7`) et les modèles ARMv6 ne sont pas pris en charge (décision de l'utilisateur,
+  2026-11-26) : une seule cible croisée à maintenir et à tester.
 - `CLAUDE.md` impose un `Dockerfile` multi-étapes, une image finale minimale, un utilisateur
   non root membre du groupe `video`, l'accès à la webcam par `--device` (jamais
   `--privileged`) et un `HEALTHCHECK` sur `/health`.
@@ -20,7 +22,7 @@
 | Option | Avantages | Inconvénients |
 |---|---|---|
 | Build natif émulé (`buildx` + QEMU, étape de build en `linux/arm64`) | Dockerfile le plus simple ; aucune configuration de cross-compilation | **Très lent** (émulation ×5 à ×20) ; timeouts possibles en CI |
-| **Cross-compilation dans l'étape de build** (`FROM --platform=$BUILDPLATFORM`, cible `aarch64-unknown-linux-gnu`) | Rapide (build natif x86_64) ; cache Cargo efficace ; même Dockerfile pour arm64 et armv7 | Configurer l'éditeur de liens croisé et bindgen (`--sysroot`, en-têtes noyau arm64) |
+| **Cross-compilation dans l'étape de build** (`FROM --platform=$BUILDPLATFORM`, cible `aarch64-unknown-linux-gnu`) | Rapide (build natif x86_64) ; cache Cargo efficace | Configurer l'éditeur de liens croisé et bindgen (`--sysroot`, en-têtes noyau arm64) |
 | Build sur le Raspberry lui-même | Aucun outil croisé | Lent, usure de la carte SD, non reproductible en CI |
 | `cross-rs` hors Docker puis `COPY` du binaire | Outil éprouvé | Deux étapes distinctes, Dockerfile non autonome |
 
@@ -35,7 +37,8 @@
 ## Décision
 
 - **Cross-compilation** dans une étape `builder` exécutée sur `$BUILDPLATFORM`, cible choisie
-  d'après `$TARGETARCH` (`arm64` → `aarch64-unknown-linux-gnu`, `arm` → `armv7-unknown-linux-gnueabihf`),
+  d'après `$TARGETARCH` (`arm64` → `aarch64-unknown-linux-gnu` ; `amd64` → build natif, pour le
+  développement et la CI uniquement ; toute autre plateforme est refusée),
   avec `gcc-aarch64-linux-gnu`, `clang`, `libclang-dev`, `linux-libc-dev-arm64-cross` et
   `BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_gnu=--sysroot=/usr/aarch64-linux-gnu`
   (variable suffixée par la cible, lue par bindgen, pour ne pas affecter un build natif).
