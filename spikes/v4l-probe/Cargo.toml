@@ -1,0 +1,27 @@
+# Spike jetable : mesure du comportement de la crate `v4l` sur une webcam réelle.
+# Crate isolée (table [workspace] vide) : elle ne fait pas partie de l'application
+# Camstream et ne doit pas être importée par le futur code (voir docs/spikes/0001-v4l.md).
+[package]
+name = "v4l-probe"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+publish = false
+description = "Spike: probe a V4L2 webcam with the v4l crate (formats, latency, timeout, reopen)"
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi"] }
+# Même choix que l'ADR 0003 : bindings générés par bindgen (v4l2-sys-mit), sans libv4l.
+v4l = { version = "0.14", default-features = false, features = ["v4l2"] }
+
+[profile.release]
+strip = "symbols"

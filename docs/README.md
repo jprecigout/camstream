@@ -21,4 +21,13 @@ Toute la documentation du projet est rédigée en français et les diagrammes so
 | [0006](adr/0006-capture-a-la-demande.md) | Capture à la demande | Proposé |
 | [0007](adr/0007-securite-reseau-local-v1.md) | Sécurité de la v1 : réseau local, sans authentification ni TLS | Proposé |
 
+## Spikes
+
+Expérimentations techniques jetables qui lèvent une incertitude avant implémentation ; le code
+correspondant est dans [`../spikes/`](../spikes/), isolé de l'application.
+
+| N° | Sujet | Statut |
+|---|---|---|
+| [0001](spikes/0001-v4l.md) | Crate `v4l` : cross-compilation arm64 et comportement réel | En cours (cross-compilation validée, mesures Pi à faire) |
+
 Les règles du projet sont décrites dans [`CLAUDE.md`](../CLAUDE.md).

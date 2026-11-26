@@ -64,6 +64,13 @@ Le choix de `v4l` est conditionné à un **spike de cross-compilation** (bindgen
 excessif, le repli est `linuxvideo` : l'adaptateur étant isolé derrière `FrameSource`, ce
 changement n'impacte que `src/capture/v4l2/`.
 
+> **Avancement du spike (2026-11-26)** : la **cross-compilation de `v4l` 0.14 vers
+> `aarch64-unknown-linux-gnu` est validée** (bindgen 0.65 via `v4l2-sys-mit` 0.3, clang 18,
+> en-têtes `linux-libc-dev-arm64-cross`), hors Docker ; binaire de 1,7 Mio sans dépendance
+> d'exécution V4L2. Restent à mesurer sur le Raspberry Pi le comportement de la crate avec une
+> webcam réelle. Le statut reste « Proposé » jusqu'à ces mesures :
+> [spike 0001](../spikes/0001-v4l.md).
+
 ## Conséquences
 
 - L'étape de build Docker doit fournir `clang`/`libclang-dev` et les en-têtes noyau de la cible
