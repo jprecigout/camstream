@@ -57,3 +57,17 @@ Points techniques à prendre en compte :
 - Aucune dépendance cryptographique en v1.
 - Le passage derrière un reverse proxy ne demande aucune modification du code (en-têtes
   `X-Forwarded-*` non utilisés) ; seul un éventuel préfixe de chemin serait à prévoir.
+
+> **Complément (robustesse après revue v1, 2026-11-26)** : toutes les réponses portent
+> `X-Content-Type-Options: nosniff`, une `Content-Security-Policy` stricte
+> (`default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; base-uri 'none';
+> form-action 'none'; frame-ancestors 'none'`), `X-Frame-Options: DENY` et
+> `Referrer-Policy: no-referrer`. Le script et le style de la page sont servis à part
+> (`/camstream.js`, `/camstream.css`) plutôt qu'autorisés en ligne par empreinte. Ces en-têtes
+> durcissent l'usage dans un navigateur ; ils ne remplacent pas l'authentification ni TLS, dont
+> l'absence reste la décision de cet ADR.
+>
+> Revue d'architecture (2026-11-26) : la couche (`server::security`, `map_response` appliqué
+> après le routage, donc aussi aux `404`/`405`) reste confinée à l'adaptateur HTTP, sans
+> impact sur le cœur ; elle n'ajoute que des en-têtes et ne met pas en mémoire le corps infini
+> du flux MJPEG. Un futur reverse proxy pourra reprendre ces en-têtes sans changement de code.

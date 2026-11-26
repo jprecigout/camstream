@@ -96,6 +96,43 @@
 mesures sur Pi montrent une latence ou une mémoire excessive avec `broadcast`, le remplacement
 est local à `FrameHub` (l'API publique `publish` / `subscribe` / `next_frame` ne change pas).
 
+> **Complément (robustesse après revue v1, 2026-11-26)** :
+>
+> - les paniques de `v4l` **hors `Drop`** (`Capabilities::from` sur un nom de carte non UTF-8,
+>   `Format::from` sur un champ inconnu, échec d'allocation mmap) sont interceptées dans
+>   l'adaptateur (`guarded`) et deviennent `CaptureError::DriverFault`, classée **`Reopen`** et
+>   non `Fatal` : la reprise n'a lieu qu'avec des spectateurs, avec attente exponentielle,
+>   l'erreur reste visible dans `/health`, alors que `Fatal` provoquerait une boucle de
+>   redémarrage Docker sans rien réparer ;
+> - des trames invalides **consécutives** au-delà de `CAMSTREAM_MAX_CORRUPTED_FRAMES` (30 par
+>   défaut) produisent `CaptureError::CorruptedStream` (`Reopen`) ;
+> - à l'arrêt, `read_timeout < shutdown_timeout` est validé (code 2 sinon) et un join expiré
+>   du thread de capture n'est plus compté comme un échec (seule une panique l'est) ;
+> - un `compile_error!` interdit `panic = "abort"`, dont dépendent ces mécanismes.
+>
+> Voir [architecture § 7.2](../architecture.md#72-robustesse-après-la-revue-de-la-v1).
+>
+> **Revue d'architecture (2026-11-26)** — choix validés :
+>
+> - **`DriverFault` en `Reopen`** : `Fatal` transformerait un défaut de bibliothèque, souvent
+>   transitoire (débranchement pendant `munmap`), en boucle de redémarrage du conteneur ; la
+>   reprise est bornée (spectateurs présents, attente exponentielle plafonnée) et visible
+>   (`/health` `reconnecting` avec le message). Limite acceptée : une cause permanente (nom de
+>   carte non UTF-8) laisse les spectateurs sans image avec un `/health` à `200` ; le
+>   diagnostic passe par le message d'erreur et les logs `error`.
+> - **`CorruptedStream` dans le port `domain`** plutôt qu'un motif interne au superviseur :
+>   l'issue « source défaillante » est un fait métier, classé par la même table
+>   `CaptureError::recovery()` et transporté par le même chemin jusqu'à
+>   `SourceStatus::Reconnecting { last_error }` ; un type interne dupliquerait ce chemin pour
+>   un seul cas. Contrepartie : la variante n'est **jamais** produite par un adaptateur (le
+>   seuil est une politique du superviseur, `SupervisorSettings::max_corrupted_frames`) ; cette
+>   règle est écrite dans le commentaire de la variante et vérifiée en revue. Si d'autres
+>   erreurs propres au superviseur apparaissent, elles seront regroupées dans un type
+>   `stream` dédié (nouvel ADR).
+> - **Join expiré non fatal à l'arrêt** (`CaptureEnd::TimedOut`) : cohérent avec la
+>   validation `read_timeout < shutdown_timeout` ; seule une panique du thread de capture
+>   donne un code 1 après un arrêt demandé.
+
 ## Conséquences
 
 - Mémoire de diffusion bornée : `capacité × taille de trame` (≈ 1 Mio au pire en 720p), quel

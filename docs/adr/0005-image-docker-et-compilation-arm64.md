@@ -73,3 +73,9 @@ Distroless pourra remplacer `bookworm-slim` une fois le déploiement stabilisé 
   depuis l'environnement du spike) ; le binaire ne requiert pas plus que `GLIBC_2.34`,
   compatible avec Bookworm. Le build `docker buildx` lui-même reste à exécuter
   ([spike 0001](../spikes/0001-v4l.md)). Statut inchangé : « Proposé ».
+
+> **Complément (robustesse après revue v1, 2026-11-26)** : la sonde `camstream healthcheck`
+> borne désormais sa durée **totale** (connexion, envoi, lecture) par
+> `CAMSTREAM_HEALTHCHECK_TIMEOUT_MS` (2 s par défaut), inférieure au `--timeout=3s` du
+> `HEALTHCHECK` : auparavant chaque étape avait son propre délai, et le pire cas (≈ 6 s)
+> dépassait celui de Docker, qui tuait la sonde sans code de sortie significatif.
