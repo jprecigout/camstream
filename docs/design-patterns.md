@@ -11,12 +11,12 @@
 | Pattern | Catégorie | Problème résolu | Où (prévu) |
 |---|---|---|---|
 | [Strategy](#strategy) | Comportement | Remplacer la webcam par une autre source sans toucher au cœur | `src/domain/source.rs` — `FrameSource` |
-| [Observer / Publish-Subscribe](#observer--publish-subscribe) | Comportement | Livrer chaque trame à N clients sans que les lents bloquent | `src/stream/hub.rs` — `FrameHub`, `FrameSubscriber` |
+| [Observer / Publish-Subscribe](#observer--publish-subscribe) | Comportement | Livrer chaque trame à N clients sans que les lents bloquent ; réveiller la capture au premier client | `src/stream/hub.rs` — `FrameHub`, `FrameSubscriber`, `DemandReceiver` |
 | [Adapter](#adapter) | Structure | Isoler la crate `v4l` et axum derrière nos propres types | `src/capture/v4l2/` — `V4l2Device`, `V4l2Source` ; `src/server/` |
 | [Factory](#factory) | Création | Recréer une source après déconnexion sans connaître son type | `src/domain/source.rs` — `FrameSourceFactory` ; `src/capture/factory.rs` — `SourceFactory` |
 | [Builder](#builder) | Création | Construire le serveur avec paramètres obligatoires et optionnels | `src/server/mod.rs` — `ServerBuilder` |
 | [Newtype](#newtype) | Idiome Rust | Interdire les valeurs invalides ou confondues | `src/domain/frame.rs`, `src/domain/device.rs`, `src/stream/hub.rs`, `src/server/mod.rs` |
-| [RAII](#raii) | Idiome Rust | Libérer périphérique, tampons, abonnements et places client sans oubli | `V4l2Source`, `FrameSubscriber`, `ClientSlot` |
+| [RAII](#raii) | Idiome Rust | Libérer périphérique, tampons, abonnements, demande et places client sans oubli | `V4l2Source`, `FrameSubscriber`, `OwnedSemaphorePermit` |
 | [Typestate](#typestate) | Idiome Rust | Garantir l'ordre ouvrir → configurer → streamer à la compilation | `src/capture/v4l2/device.rs` — `V4l2Device<S>` |
 
 ---
@@ -66,6 +66,11 @@ classDiagram
   pour l'état : `watch<SourceStatus>` (`src/stream/status.rs`).
 - **Politique clients lents** : `RecvError::Lagged(n)` est absorbé par `FrameSubscriber` (trames
   sautées comptées), le client continue.
+- **Seconde observation, en sens inverse : la demande** ([ADR 0006](adr/0006-capture-a-la-demande.md)).
+  Pour la capture à la demande, le `CaptureSupervisor` observe le **nombre d'abonnés** du hub
+  via `DemandReceiver` (`watch<usize>`) : il est réveillé au premier abonné et apprend le départ
+  du dernier. Le compteur est tenu par le hub (et non par le serveur HTTP) pour rester
+  indépendant du transport.
 
 ```mermaid
 classDiagram
@@ -82,6 +87,12 @@ classDiagram
         +skipped_frames() u64
     }
     class CaptureSupervisor
+    class DemandReceiver {
+        -receiver watch_Receiver
+        +subscriber_count() usize
+        +wait_for_subscribers()
+        +wait_for_no_subscribers()
+    }
     class MjpegStream {
         <<server>>
     }
@@ -89,6 +100,9 @@ classDiagram
         <<futur>>
     }
     CaptureSupervisor --> FrameHub : publish
+    FrameHub ..> DemandReceiver : demand()
+    CaptureSupervisor --> DemandReceiver : observe la demande
+    FrameSubscriber ..> DemandReceiver : plus 1 à la création, moins 1 au drop
     FrameHub "1" ..> "0..*" FrameSubscriber : diffuse
     MjpegStream --> FrameSubscriber : possède
     WebRtcTransport ..> FrameSubscriber : possèdera
@@ -248,20 +262,26 @@ classDiagram
   webcam, arrêt `SIGTERM`) doit libérer les ressources sans code de nettoyage explicite :
   - `V4l2Source` : `STREAMOFF`, `munmap` des tampons et fermeture du descripteur (via les `Drop`
     de `v4l`) — indispensable pour rouvrir la webcam après reconnexion ;
-  - `FrameSubscriber` : désabonnement du `broadcast` dès que le flux HTTP est détruit ;
-  - `ClientSlot` (`src/server/mjpeg.rs`) : décrémente le compteur de clients dans son `Drop`,
-    même si le client coupe brutalement la connexion.
+  - `FrameSubscriber` : désabonnement du `broadcast` **et décrément de la demande** dès que le
+    flux HTTP est détruit ; c'est l'unique chemin de décrément, ce qui garantit que la capture à
+    la demande voit un compteur exact ;
+  - `OwnedSemaphorePermit` (obtenu par `ClientLimiter::try_acquire`, `src/server/mjpeg.rs`) :
+    rend la place de client au `Semaphore` à sa destruction, même si le client coupe
+    brutalement la connexion. Il remplace le `ClientSlot` maison sur `AtomicUsize` envisagé
+    d'abord : même idiome, mais fourni et éprouvé par tokio, sans course possible.
 
 ```mermaid
 sequenceDiagram
     participant H as hyper
     participant B as Corps MJPEG
     participant Sub as FrameSubscriber
-    participant Slot as ClientSlot
+    participant Permit as OwnedSemaphorePermit
+    participant Sup as CaptureSupervisor
     H->>B: écriture échouée, client parti
     H->>B: drop
-    B->>Sub: drop donc désabonnement
-    B->>Slot: drop donc compteur moins 1
+    B->>Sub: drop donc désabonnement et demande moins 1
+    Sub-->>Sup: demande à 0, début du délai de grâce
+    B->>Permit: drop donc place rendue au Semaphore
 ```
 
 ## Typestate
@@ -321,4 +341,6 @@ classDiagram
 | Singleton / état global | Interdit par `CLAUDE.md` ; tout est injecté par construction depuis `app`. |
 | Abstract Factory multi-familles | Une seule famille de produits (`FrameSource`) : la fabrique à une méthode suffit. |
 | Trait pour `FrameHub` | Le hub est le cœur lui-même ; les tests utilisent le vrai hub. Un trait n'ajouterait qu'une indirection. |
+| Typestate pour la capture à la demande | Allumage et extinction dépendent d'événements d'exécution (abonnés, délais) : même raison que pour le superviseur, l'`enum` + `match` convient mieux. |
+| Pause de la webcam derrière un trait `Pausable` | La destruction de la source (RAII) et sa recréation par la fabrique couvrent le besoin sans élargir le port `FrameSource` ([ADR 0006](adr/0006-capture-a-la-demande.md)). |
 | Command / Mediator | Aucun besoin de commandes différées ni d'orchestration complexe en v1. |
