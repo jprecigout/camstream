@@ -1,0 +1,11 @@
+# Contexte de build Docker : uniquement ce qui sert à compiler camstream.
+target/
+.git/
+.github/
+.claude/
+docs/
+spikes/
+scripts/
+docker-compose.yml
+Dockerfile
+.dockerignore

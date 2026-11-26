@@ -1,11 +1,13 @@
 # Architecture de Camstream
 
-> Statut : **conception initiale (proposée)**, avant implémentation. Les décisions sont tracées
-> dans les ADR [0001](adr/0001-architecture-hexagonale-et-decoupage-en-modules.md) à
-> [0007](adr/0007-securite-reseau-local-v1.md). Les signatures Rust de ce document
-> sont des **propositions** : l'implémentation peut les ajuster (noms de champs privés,
-> détails d'API des crates), mais toute modification d'un **port** (trait) ou d'une frontière
-> entre modules passe par une revue d'architecture.
+> Statut : **v1 implémentée** (branche `feat/v1`). Les décisions sont tracées dans les ADR
+> [0001](adr/0001-architecture-hexagonale-et-decoupage-en-modules.md) à
+> [0007](adr/0007-securite-reseau-local-v1.md). Les signatures Rust de ce document reflètent le
+> code ; les corps de fonctions sont omis. Les écarts avec la conception initiale sont listés au
+> [§ 11](#11-écarts-entre-la-conception-initiale-et-limplémentation). Toute modification d'un
+> **port** (trait) ou d'une frontière entre modules passe par une revue d'architecture.
+> Les mesures sur Raspberry Pi du [spike 0001](spikes/0001-v4l.md) restent à faire : les valeurs
+> par défaut documentées sont conservées en attendant.
 
 ## 1. Vue d'ensemble
 
@@ -43,39 +45,52 @@ Une seule crate `camstream` (bibliothèque + binaire), organisée en architectur
 
 ```text
 src/
-├── main.rs              # point d'entrée : parsing config, logs, signaux, anyhow
-├── lib.rs               # expose les modules (tests d'intégration)
-├── app.rs               # racine de composition : App, câblage, cycle de vie
+├── main.rs              # point d'entrée : config, logs, runtime, signaux, codes de sortie (anyhow)
+├── lib.rs               # expose les modules (tests d'intégration) ; #![forbid(unsafe_code)]
+├── app.rs               # racine de composition : App, BoundApp, Outcome (anyhow)
 ├── domain/              # CŒUR — types et ports, aucune dépendance technique
 │   ├── mod.rs
-│   ├── frame.rs         # Frame, Resolution, Fps, SequenceNumber, PixelFormat
+│   ├── frame.rs         # Frame, Resolution, Fps, SequenceNumber, PixelFormat, ParseResolutionError
 │   ├── device.rs        # DevicePath, CaptureSettings, SourceKind, FormatPreference
 │   └── source.rs        # ports FrameSource, FrameSourceFactory ; CaptureError, Recovery, SourceDescription
 ├── stream/              # CŒUR — distribution des trames et supervision
 │   ├── mod.rs
 │   ├── hub.rs           # FrameHub, FrameSubscriber, DemandReceiver, HubCapacity
-│   ├── status.rs        # SourceStatus
-│   └── supervisor.rs    # CaptureSupervisor, SupervisorSettings, BackoffPolicy, CaptureHandle
+│   ├── status.rs        # SourceStatus, StatusReceiver
+│   └── supervisor.rs    # CaptureSupervisor, SupervisorSettings, BackoffPolicy, CaptureHandle,
+│                        # CaptureThreadError, PanicGuard (privé)
 ├── capture/             # ADAPTATEURS de source
 │   ├── mod.rs
 │   ├── factory.rs       # SourceFactory (Factory)
-│   ├── synthetic.rs     # SyntheticSource (mire de test JPEG embarquée)
+│   ├── jpeg.rs          # complete_jpeg_len : vérification SOI/EOI, retrait du bourrage
+│   ├── synthetic.rs     # SyntheticSource (mire JPEG embarquée, assets/synthetic/)
 │   └── v4l2/            # feature Cargo « v4l2 » (par défaut)
-│       ├── mod.rs
-│       ├── device.rs    # V4l2Device<S> (Typestate) : Opened -> Configured
-│       ├── source.rs    # V4l2Source : impl FrameSource (Adapter)
-│       └── encoder.rs   # JpegEncoder (repli YUYV, phase 2, feature « yuyv »)
+│       ├── mod.rs       # open_source(settings)
+│       ├── device.rs    # V4l2Device<S> (Typestate) : Opened -> Configured -> V4l2Source
+│       ├── source.rs    # V4l2Source : impl FrameSource (Adapter, RAII)
+│       ├── errno.rs     # map_open_error, map_io_error (traduction des errno)
+│       └── release.rs   # Released<T> : Drop de v4l sous catch_unwind (RAII)
 ├── server/              # ADAPTATEUR HTTP (axum)
-│   ├── mod.rs           # ServerBuilder, Server, ServerError
-│   ├── routes.rs        # routeur : /, /stream.mjpg, /health
-│   ├── mjpeg.rs         # corps multipart en streaming, permis de client (Semaphore, RAII)
+│   ├── mod.rs           # ServerBuilder, Server, BoundServer, ServerError
+│   ├── routes.rs        # routeur : /, /stream.mjpg, /health ; ServerState (privé)
+│   ├── mjpeg.rs         # corps multipart en streaming, MaxClients, ClientLimiter (Semaphore, RAII)
 │   ├── health.rs        # HealthReport (DTO serde) + client healthcheck (sous-commande)
-│   ├── net.rs           # options de socket TCP (keepalive, TCP_USER_TIMEOUT)
+│   ├── net.rs           # TcpOptions, apply_tcp_options (keepalive, TCP_USER_TIMEOUT, NODELAY)
 │   └── index.html       # page minimale (include_str!)
 └── config/              # lecture et validation de la configuration
-    ├── mod.rs           # AppConfig, ConfigError
-    └── cli.rs           # Cli (clap derive + env)
+    ├── mod.rs           # Command (Serve / Healthcheck), AppConfig, HealthcheckConfig, ConfigError
+    └── cli.rs           # Cli (clap derive + env), enums miroirs SourceArg / FormatArg
+
+tests/
+├── support/mod.rs       # ScriptedFactory / ScriptedSource, TestApp, client HTTP, MultipartReader
+├── supervisor.rs        # capture à la demande, grâce, reconnexion, Fatal, panique, arrêt
+├── http.rs              # bout en bout : page, multipart, 503, /health, healthcheck, arrêt
+└── lifecycle.rs         # codes de sortie : arrêt, erreur fatale, panique, runtime refusé
+
+assets/synthetic/        # 10 images JPEG 640x480 de la mire (scripts/generate_synthetic_frames.py)
 ```
+
+Le repli YUYV (`encoder.rs`, feature `yuyv`) prévu en phase 2 n'existe pas encore.
 
 ### Graphe de dépendances entre modules
 
@@ -184,8 +199,9 @@ pub struct Resolution {
 }
 
 impl Resolution {
-    /// Construit une résolution ; `None` si une dimension est nulle.
-    pub fn new(width: u32, height: u32) -> Option<Self>;
+    /// Construit une résolution ; `None` si une dimension est nulle (`const` : utilisable
+    /// pour des constantes vérifiées à la compilation).
+    pub const fn new(width: u32, height: u32) -> Option<Self>;
     /// Largeur en pixels.
     pub fn width(&self) -> u32;
     /// Hauteur en pixels.
@@ -199,14 +215,28 @@ impl std::str::FromStr for Resolution {
 }
 
 /// Nombre d'images par seconde demandé ou négocié (**Newtype**, non nul).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Fps(NonZeroU32);
+
+impl Fps {
+    pub const fn new(fps: u32) -> Option<Self>;
+    pub fn get(self) -> u32;
+    /// Intervalle théorique entre deux images (`1 / fps`).
+    pub fn frame_interval(self) -> Duration;
+}
 
 /// Numéro de séquence monotone d'une trame, attribué par la source (**Newtype**).
 ///
 /// Permet aux clients et aux logs de détecter les trames sautées.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct SequenceNumber(u64);
+
+impl SequenceNumber {
+    pub fn new(value: u64) -> Self;
+    pub fn get(self) -> u64;
+    /// Numéro suivant (saturant).
+    pub fn next(self) -> Self;
+}
 
 /// Format de pixels négocié avec le périphérique.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -332,6 +362,8 @@ pub trait FrameSourceFactory: Send {
 }
 
 /// Erreurs de capture, typées pour permettre une politique de reprise.
+///
+/// Pas de `#[from] std::io::Error` : chaque adaptateur traduit explicitement les `errno`.
 #[derive(Debug, thiserror::Error)]
 pub enum CaptureError {
     /// Le périphérique n'existe pas (pas encore branché ou chemin erroné).
@@ -343,18 +375,25 @@ pub enum CaptureError {
     /// Droits insuffisants (utilisateur hors du groupe `video`, `--device` absent).
     #[error("permission denied on video device: {0}")]
     PermissionDenied(DevicePath),
+    /// Le nœud n'est pas un périphérique de capture en streaming (ex. nœud de
+    /// métadonnées `/dev/video1` d'une webcam UVC).
+    #[error("not a streaming video capture device: {0}")]
+    NotACaptureDevice(DevicePath),
     /// Aucun format compatible avec la préférence demandée.
     #[error("no supported pixel format for preference {preference:?}")]
     UnsupportedFormat { preference: FormatPreference },
+    /// Type de source non compilé dans ce binaire (feature `v4l2` absente).
+    #[error("source kind {0} is not available in this build")]
+    SourceNotAvailable(SourceKind),
     /// Aucune trame reçue dans le délai imparti.
     #[error("timed out waiting for a frame")]
     Timeout,
-    /// Trame invalide (JPEG tronqué, tampon vide) : on la jette.
+    /// Trame invalide (JPEG tronqué, tampon vide, drapeau d'erreur du pilote) : on la jette.
     #[error("corrupted frame")]
     CorruptedFrame,
-    /// Autre erreur d'entrée/sortie du pilote.
+    /// Autre erreur d'entrée/sortie du pilote (dont `EINVAL`, `EBUSY`).
     #[error("video I/O error")]
-    Io(#[from] std::io::Error),
+    Io(#[source] std::io::Error),
 }
 
 /// Action de reprise associée à une erreur de capture.
@@ -394,12 +433,12 @@ pub struct SourceDescription {
 
 Remarques d'implémentation :
 
-- `DevicePath` doit implémenter `Display` (via `Path::display`) pour les messages
+- `DevicePath` implémente `Display` (via `Path::display`) pour les messages
   `#[error("... {0}")]` : `PathBuf` n'implémente pas `Display`.
-- `#[from] std::io::Error` sur `Io` rend la conversion implicite par `?` : toute erreur
-  d'entrée/sortie de `v4l` deviendrait `Io` sans passer par la traduction des `errno`
-  (`ENODEV` → `Disconnected`, etc.). L'adaptateur doit donc convertir explicitement
-  (fonction `map_io_error`), et `#[from]` peut être retiré.
+- `#[from] std::io::Error` a été retiré de `Io` : l'adaptateur V4L2 convertit explicitement
+  (`capture::v4l2::errno::map_open_error` à l'ouverture, `map_io_error` ensuite), pour que
+  `ENODEV` devienne `Disconnected`, `EACCES`/`EPERM` `PermissionDenied`, etc.
+- `SourceDescription` implémente `Display` (« Cam (MJPEG 640x480 @ 15 fps) ») pour les logs.
 
 ### 3.4 `stream` — diffuseur, état et superviseur
 
@@ -427,8 +466,9 @@ pub struct HubCapacity(NonZeroUsize);
 #[derive(Debug, Clone)]
 pub struct FrameHub {
     sender: broadcast::Sender<Frame>,
-    // `Arc` car chaque abonné doit pouvoir décrémenter le compteur dans son `Drop`.
-    demand: Arc<watch::Sender<usize>>,
+    // `watch::Sender` est `Clone` : chaque abonné en garde un clone pour décrémenter
+    // la demande dans son `Drop`, sans `Arc` supplémentaire.
+    demand: watch::Sender<usize>,
 }
 
 impl FrameHub {
@@ -461,7 +501,7 @@ impl FrameHub {
 #[derive(Debug)]
 pub struct FrameSubscriber {
     receiver: broadcast::Receiver<Frame>,
-    demand: Arc<watch::Sender<usize>>,
+    demand: watch::Sender<usize>,
     skipped: u64,
 }
 
@@ -497,6 +537,8 @@ impl DemandReceiver {
     pub async fn wait_for_subscribers(&mut self);
     /// Se résout dès que plus aucun abonné n'existe.
     pub async fn wait_for_no_subscribers(&mut self);
+    // Si le hub entier a disparu, ces attentes ne se résolvent jamais (la demande ne
+    // peut plus changer) : elles sont toujours combinées au jeton d'annulation.
 }
 
 /// État observable de la capture, publié via `tokio::sync::watch`.
@@ -519,19 +561,24 @@ pub enum SourceStatus {
 }
 
 /// Politique d'attente exponentielle entre deux tentatives de reconnexion.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]   // Default = DEFAULT
 pub struct BackoffPolicy {
     initial: Duration,
     max: Duration,
 }
 
 impl BackoffPolicy {
+    /// 1 s, doublée à chaque échec, plafonnée à 30 s.
+    pub const DEFAULT: Self;
+    /// `max` est relevé à `initial` s'il lui est inférieur.
+    pub fn new(initial: Duration, max: Duration) -> Self;
     /// Délai avant la tentative numéro `attempt` (1, 2, 4… plafonné à `max`).
     pub fn delay(&self, attempt: u32) -> Duration;
 }
 
 /// Réglages du superviseur, regroupés pour garder un constructeur lisible.
-#[derive(Debug, Clone, Copy)]
+/// `Default` : attente exponentielle 1 s → 30 s, délai de grâce 10 s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SupervisorSettings {
     /// Attente entre deux tentatives de reconnexion.
     pub backoff: BackoffPolicy,
@@ -572,7 +619,8 @@ impl CaptureSupervisor {
     /// Récepteur de l'état de la source (pour `/health`, les logs et `main`).
     pub fn status(&self) -> watch::Receiver<SourceStatus>;
 
-    /// Démarre la boucle dans le thread `camstream-capture`.
+    /// Démarre la boucle dans le thread `camstream-capture`. Un gardien RAII
+    /// (`PanicGuard`) publie `Failed` si le thread panique.
     pub fn spawn(self) -> std::io::Result<CaptureHandle>;
 }
 
@@ -582,39 +630,52 @@ pub struct CaptureHandle {
 }
 
 impl CaptureHandle {
-    /// Attend la fin du thread (à appeler après annulation du jeton).
+    /// Vrai si le thread est terminé.
+    pub fn is_finished(&self) -> bool;
+    /// Attend la fin du thread (bloquant : via `spawn_blocking` depuis du code async).
     ///
-    /// Renvoie l'erreur fatale éventuelle ayant provoqué l'arrêt de la capture.
-    pub fn join(self) -> Result<(), CaptureError>;
+    /// Renvoie l'erreur fatale ou la panique ayant provoqué l'arrêt de la capture.
+    pub fn join(self) -> Result<(), CaptureThreadError>;
+}
+
+/// Fin anormale du thread de capture.
+#[derive(Debug, thiserror::Error)]
+pub enum CaptureThreadError {
+    /// La capture s'est arrêtée sur une erreur non récupérable.
+    #[error("capture stopped on a fatal error")]
+    Fatal(#[source] CaptureError),
+    /// Le thread de capture a paniqué (message de la panique).
+    #[error("capture thread panicked: {0}")]
+    Panicked(String),
 }
 ```
 
-Boucle du superviseur (pseudo-code, détail dans le § 7) :
+Boucle du superviseur (pseudo-code de `stream/supervisor.rs`, détail dans le § 7) :
 
 ```text
 statut = Starting
 sonde : source = factory.create()
     Fatal  -> statut Failed, fin du thread avec l'erreur
-    Reopen -> warn, source = aucune
-    Ok     -> drop(source)                      # webcam rendue tout de suite
+    Reopen -> abonnés présents ? tentative = 1, statut Reconnecting : warn, tentative = 0
+    Ok     -> abonnés présents ? garder la source (décision § 7.1) : drop(source)
 boucle :
-    statut = Idle
-    attendre(premier abonné | jeton)            # block_on + select!
-    tentative = 0
-    boucle d'ouverture :
-        statut = Starting ; créer la source
-        Ok    -> boucle de lecture (ci-dessous)
-        Reopen-> tentative += 1 ; statut Reconnecting
-                 attendre(backoff.delay(tentative) | plus d'abonné | jeton)
-                 plus d'abonné -> retour à Idle
-        Fatal -> statut Failed, fin
+    source en attente ? -> boucle de lecture
+    acquisition :
+        tentative == 0 : si demande == 0 { statut Idle ; attendre(premier abonné | jeton) }
+                         statut Starting ; création immédiate
+        tentative >  0 : attendre(backoff.delay(tentative) | plus d'abonné | jeton)
+                         plus d'abonné -> tentative = 0, retour à l'acquisition (Idle)
+        create() : Ok -> boucle de lecture ; Fatal -> Failed, fin
+                   Reopen -> demande > 0 ? tentative += 1, statut Reconnecting : tentative = 0
     boucle de lecture :
-        next_frame() -> publish ; tentative = 0 ; statut Streaming
-        si demande == 0 : démarrer l'échéance de grâce (si pas déjà fait)
-        si demande > 0  : annuler l'échéance
-        échéance dépassée -> drop(source), retour à Idle
-        erreur Skip -> ignorer ; erreur Reopen -> drop(source), boucle d'ouverture
+        demande == 0 : armer l'échéance de grâce (si pas déjà fait) ; échéance dépassée
+                       -> drop(source), tentative = 0, retour à l'acquisition (Idle)
+        demande > 0  : désarmer l'échéance
+        next_frame() -> publish ; tentative = 0 ; statut Streaming à la première trame
+        erreur Skip -> ignorer ; Reopen -> drop(source), comme un échec de create() ;
+        Fatal -> drop(source), Failed, fin
 jeton annulé à tout moment -> drop(source), statut Stopped, fin
+panique à tout moment -> PanicGuard : statut Failed (« capture thread panicked »), fin du thread
 ```
 
 Pendant la lecture, la demande est lue sans attente (`subscriber_count()`) entre deux trames ;
@@ -650,17 +711,19 @@ Remarques d'implémentation (API réelles de `tokio` / `std`) :
   lecture** (non `Send`) : le relâcher immédiatement (`.map(|_| ())`), ne jamais le garder à
   travers un `.await`. Il examine la valeur courante avant d'attendre, même si l'émetteur est
   déjà détruit : un `Failed` publié juste avant la fin du thread est donc bien vu. En revanche,
-  si le thread se termine **sans** publier `Failed` (panique, par exemple dans le `Drop` de
-  `v4l`), `wait_for` renvoie `Err(RecvError)` : `main` doit traiter ce cas comme une fin
-  anormale de la capture.
+  si le thread se termine **sans** publier `Failed`, `wait_for` renvoie `Err(RecvError)` :
+  `app` traite ce cas comme une fin anormale de la capture (code 1). En pratique, une panique
+  publie tout de même `Failed` grâce au `PanicGuard` ; l'`Err` reste traité par défense en
+  profondeur.
 - `watch::Sender<T>` est `Clone` (vérifié dans tokio 1.54) : l'`Arc` autour du compteur de demande est
   donc facultatif ; un clone du `Sender` dans chaque `FrameSubscriber` suffit.
 - `std::thread::JoinHandle::join` est **bloquant et sans délai maximal** : `CaptureHandle::join`
   ne doit pas être appelé directement depuis une tâche async. `app` l'appelle via
   `tokio::task::spawn_blocking`, enveloppé dans `tokio::time::timeout(shutdown_timeout, …)`.
-  `join` renvoie aussi `Err(Box<dyn Any + Send>)` si le thread a paniqué (notamment le `Drop`
-  de `v4l::io::mmap::Stream`, qui panique sur une erreur de `STREAMOFF` autre que `ENODEV`) :
-  ce cas doit être traduit (variante dédiée ou erreur `anyhow` dans `app`).
+  `std::thread::JoinHandle::join` renvoie `Err(Box<dyn Any + Send>)` si le thread a paniqué :
+  `CaptureHandle::join` le traduit en `CaptureThreadError::Panicked(message)`. Les paniques des
+  `Drop` de `v4l` (`STREAMOFF` autre que `ENODEV`, `munmap`, `close`) sont, elles, contenues
+  dans l'adaptateur (`Released<T>`, § 3.5) et n'atteignent pas le superviseur.
 
 ### 3.5 `capture` — adaptateurs
 
@@ -704,13 +767,15 @@ pub struct Configured {
 ///
 /// Implémente les patterns **Adapter** (masque l'API `v4l`) et **Typestate**.
 pub struct V4l2Device<S> {
-    device: v4l::Device,
+    device: Released<v4l::Device>,   // Drop sous catch_unwind
     path: DevicePath,
+    name: String,                    // carte (QUERYCAP), pour SourceDescription
     state: S,
 }
 
 impl V4l2Device<Opened> {
-    /// Ouvre le périphérique ; traduit ENOENT/EACCES en `CaptureError` typées.
+    /// Ouvre le périphérique ; traduit ENOENT/EACCES/EPERM/ENODEV en `CaptureError`
+    /// typées ; vérifie `VIDEO_CAPTURE | STREAMING` (sinon `NotACaptureDevice`, fatale).
     pub fn open(path: &DevicePath) -> Result<Self, CaptureError>;
 
     /// Négocie format, résolution et cadence (MJPEG prioritaire, YUYV en repli
@@ -725,8 +790,21 @@ impl V4l2Device<Configured> {
 }
 
 /// Source V4L2 en streaming ; arrête le flux et libère les tampons à la
-/// destruction (**RAII**, via les `Drop` de `v4l`).
-pub struct V4l2Source { /* flux mmap, format négocié, séquence, encodeur optionnel */ }
+/// destruction (**RAII**, via les `Drop` de `v4l`, sous `catch_unwind`).
+pub struct V4l2Source {
+    stream: Released<MmapStream<'static>>,   // détruit en premier (ordre des champs)
+    _device: Released<v4l::Device>,
+    path: DevicePath,
+    description: SourceDescription,
+    sequence: SequenceNumber,
+}
+
+/// Ressource `v4l` détruite sous `catch_unwind` (**RAII**) : une panique d'un `Drop` de
+/// `v4l` est journalisée au lieu d'arrêter le thread de capture.
+pub(crate) struct Released<T> { value: Option<T>, what: &'static str }
+
+/// Ouvre, configure et démarre une webcam (utilisé par `SourceFactory`).
+pub fn open_source(settings: &CaptureSettings) -> Result<V4l2Source, CaptureError>;
 
 impl FrameSource for V4l2Source {
     /// Copie le tampon mmap dans un `Bytes` (seule copie de la chaîne) puis le rend
@@ -736,7 +814,14 @@ impl FrameSource for V4l2Source {
 }
 ```
 
-> Constats sur `v4l` 0.14.0 (code source vérifié), à confirmer par le spike sur matériel :
+> Constats sur `v4l` 0.14.0 (code source vérifié), à confirmer par le spike sur matériel.
+> Leur prise en compte dans le code : troncature à `bytesused` puis vérification
+> `SOI`/`EOI` et retrait du bourrage (`capture::jpeg::complete_jpeg_len`) ; trame marquée
+> `V4L2_BUF_FLAG_ERROR` → `CorruptedFrame` ; délai de `poll` borné à `i32::MAX` ms ;
+> `Timeout` → `Reopen` ; `Drop` sous `catch_unwind` (`Released<T>`) ; `STREAMON` envoyé par
+> `v4l` à la première lecture (la latence de démarrage apparaît dans le premier
+> `next_frame`).
+>
 >
 > - **Pas d'auto-référence** : `MmapStream::with_buffers(&dev, Type::VideoCapture, n)` clone
 >   l'`Arc<Handle>` du `Device` et ne l'emprunte pas ; le paramètre de durée de vie ne concerne
@@ -765,8 +850,9 @@ impl FrameSource for V4l2Source {
 ```rust
 //! Adaptateur HTTP (axum) : page d'accueil, flux MJPEG et santé.
 
-/// Nombre maximal de clients de flux simultanés (**Newtype**, non nul).
-#[derive(Debug, Clone, Copy)]
+/// Nombre maximal de clients de flux simultanés (**Newtype**, non nul ; `DEFAULT` = 10).
+/// Défini dans `server/mjpeg.rs`, réexporté par `server`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MaxClients(NonZeroUsize);
 
 /// Construit le serveur HTTP étape par étape.
@@ -795,13 +881,26 @@ impl ServerBuilder {
 }
 
 /// Serveur HTTP prêt à démarrer.
-pub struct Server { /* routeur, adresse, jeton */ }
+pub struct Server { /* adresse, routeur, options TCP, jeton */ }
 
 impl Server {
     /// Routeur axum, exposé pour les tests sans socket (`tower::ServiceExt::oneshot`).
     pub fn router(&self) -> axum::Router;
-    /// Écoute et sert jusqu'à l'annulation du jeton.
+    /// Réserve l'adresse (erreur `Bind` immédiate si le port est occupé).
+    pub async fn bind(self) -> Result<BoundServer, ServerError>;
+    /// `bind` puis `serve`.
     pub async fn run(self) -> Result<(), ServerError>;
+}
+
+/// Serveur dont l'adresse est réservée : permet de connaître le port réel (port 0 en test)
+/// avant de servir.
+pub struct BoundServer { /* TcpListener, adresse effective, routeur, options, jeton */ }
+
+impl BoundServer {
+    pub fn local_addr(&self) -> SocketAddr;
+    /// Sert jusqu'à l'annulation du jeton puis attend la fin des connexions (à borner
+    /// par l'appelant).
+    pub async fn serve(self) -> Result<(), ServerError>;
 }
 
 /// Limiteur de clients de flux : `MaxClients` permis.
@@ -834,6 +933,8 @@ pub struct TcpOptions {
     /// Durée maximale de données non acquittées avant fermeture par le noyau
     /// (`TCP_USER_TIMEOUT`, Linux).
     pub user_timeout: Duration,
+    /// `TCP_NODELAY` (défaut : vrai) : chaque partie MJPEG part sans attendre.
+    pub nodelay: bool,
 }
 
 /// Représentation JSON de `/health` (DTO de l'adaptateur HTTP).
@@ -841,8 +942,9 @@ pub struct TcpOptions {
 /// Découple le contrat JSON des types du cœur, qui restent sans `serde`.
 #[derive(Debug, serde::Serialize)]
 pub struct HealthReport {
-    /// `"ok"` ou `"failed"`.
-    pub status: &'static str,
+    /// `HealthState::Ok` / `Failed`, sérialisé en `"ok"` ou `"failed"` ; le code
+    /// HTTP en est déduit (pas de comparaison de chaînes).
+    pub status: HealthState,
     /// État de la caméra (`state` : `starting`, `idle`, `streaming`, `reconnecting`,
     /// `failed`, `stopped`, plus les détails utiles).
     pub camera: CameraReport,
@@ -858,6 +960,9 @@ pub struct CameraReport {
     /// Paramètres négociés, présents en `streaming`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<SourceReport>,
+    /// Numéro de tentative, présent en `reconnecting`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
     /// Dernière erreur, présente en `reconnecting` et `failed`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -865,11 +970,25 @@ pub struct CameraReport {
 
 /// DTO de `SourceDescription` (nom, format, `"640x480"`, cadence).
 #[derive(Debug, serde::Serialize)]
-pub struct SourceReport { /* name, pixel_format, resolution, fps */ }
+pub struct SourceReport { pub name: String, pub pixel_format: &'static str,
+                          pub resolution: String, pub fps: u32 }
 
 /// Correspondance explicite cœur → JSON : renommer une variante du cœur ne change
 /// pas le contrat JSON sans modification visible ici.
 impl From<&SourceStatus> for CameraReport { /* ... */ }
+
+impl HealthReport {
+    pub fn new(status: &SourceStatus, clients: usize) -> Self;
+    /// 503 si `failed`, 200 sinon.
+    pub fn http_status(&self) -> StatusCode;
+}
+
+/// Client de la sous-commande `camstream healthcheck` (bibliothèque standard, bloquant).
+pub fn healthcheck_target(bind: IpAddr, port: u16) -> SocketAddr; // 0.0.0.0 -> 127.0.0.1, :: -> ::1
+pub fn check(addr: SocketAddr, timeout: Duration) -> Result<(), HealthcheckError>;
+
+/// Échec de la sonde : `Connect`, `Io`, `InvalidResponse`, `Unhealthy(code)`.
+pub enum HealthcheckError { /* ... */ }
 
 /// Erreurs du serveur HTTP.
 #[derive(Debug, thiserror::Error)]
@@ -891,9 +1010,9 @@ Routes :
 | Route | Réponse |
 |---|---|
 | `GET /` | Page HTML minimale (`<img src="/stream.mjpg">`, texte « Démarrage de la caméra… » jusqu'au premier `onload`, quelques lignes de JS pour recharger l'image si la connexion tombe) |
-| `GET /stream.mjpg` | `200`, `multipart/x-mixed-replace; boundary=frame`, corps infini ; `503` si `MaxClients` atteint |
+| `GET /stream.mjpg` | `200`, `multipart/x-mixed-replace; boundary=frame`, `Cache-Control: no-cache, no-store, must-revalidate`, corps infini ; `503` (avec `Retry-After: 5`) si `MaxClients` atteint |
 | `GET /health` | JSON `HealthReport`, ex. `{"status":"ok","camera":{"state":"idle"},"clients":0}` ; `200` dans tous les états sauf `failed` → `503` |
-| autre | `404` |
+| autre | `404` ; méthode autre que `GET`/`HEAD` sur une route connue : `405` |
 
 Format d'une partie MJPEG (deux `Bytes` émis successivement, sans copie du JPEG) :
 
@@ -941,9 +1060,9 @@ axum::serve(listener, router).with_graceful_shutdown(token.cancelled_owned()).aw
 Avec `socket2` 0.6 : `SockRef::set_tcp_keepalive(&TcpKeepalive::new().with_time(..)
 .with_interval(..).with_retries(..))` et `SockRef::set_tcp_user_timeout(Some(..))`.
 `with_retries` et `set_tcp_user_timeout` n'existent qu'avec la feature **`all`** de `socket2`
-(et, pour le second, sous Linux/Android/Fuchsia), ce qui convient à la cible. `TCP_NODELAY`
-(`stream.set_nodelay(true)`) peut être appliqué au même endroit pour réduire la latence des
-parties.
+(et, pour le second, sous Linux/Android/Fuchsia), ce qui convient à la cible ; le code les
+conditionne à `target_os = "linux"`/`"android"`. `TCP_NODELAY` est appliqué au même endroit
+(`TcpOptions::nodelay`) pour réduire la latence des parties.
 
 ### 3.7 `config`
 
@@ -974,7 +1093,15 @@ pub struct AppConfig {
     pub shutdown_timeout: Duration,
 }
 
-impl AppConfig {
+/// Ce que l'invocation demande de faire.
+pub enum Command {
+    /// Démarrer le serveur de diffusion.
+    Serve(AppConfig),
+    /// `camstream healthcheck` : interroger `/health` de l'instance locale.
+    Healthcheck(HealthcheckConfig),
+}
+
+impl Command {
     /// Lit la CLI et l'environnement (`CAMSTREAM_*`), applique les défauts, valide.
     pub fn load() -> Result<Self, ConfigError>;
     /// Variante testable à partir d'arguments explicites.
@@ -982,6 +1109,13 @@ impl AppConfig {
     where
         I: IntoIterator<Item = T>,
         T: Into<std::ffi::OsString> + Clone;
+}
+
+/// Paramètres de la sous-commande `healthcheck` (`--bind`/`--port` sont des options
+/// globales, partagées avec le serveur ; `--timeout-ms`, défaut 2000).
+pub struct HealthcheckConfig {
+    pub bind: SocketAddr,
+    pub timeout: Duration,
 }
 
 /// Erreurs de configuration.
@@ -997,15 +1131,55 @@ pub enum ConfigError {
 ```
 
 `config` ne dépend que de `domain` (newtypes) : il ne connaît ni `FrameHub` ni axum. Comme
-`domain` ne doit pas dépendre de `clap`, `SourceKind` et `FormatPreference` ne peuvent pas
-dériver `clap::ValueEnum` : soit `domain` implémente `FromStr` (clap l'utilise alors comme
-analyseur de valeur), soit `config` déclare ses propres enums miroirs et les convertit. À noter
-aussi : `try_parse_from` lit quand même les variables `CAMSTREAM_*` du processus (feature
-`env`) ; les tests de configuration doivent en tenir compte. C'est
+`domain` ne doit pas dépendre de `clap`, `config/cli.rs` déclare des enums miroirs
+(`SourceArg`, `FormatArg`, `clap::ValueEnum`) convertis par `From` ; `Resolution` est analysée
+par son `FromStr`. Les commentaires `///` des options sont en français (règle du projet) et
+le texte d'aide, technique, est donné en anglais par l'attribut `help`. Validation
+(`ConfigError::Invalid`, code de sortie 2) : `--format yuyv` refusé en v1, délai de lecture
+supérieur à l'intervalle entre images, `--hub-capacity` ≤ 64, `--reconnect-max-ms` ≥
+`--reconnect-initial-ms`. À noter : `try_parse_from` lit quand même les variables
+`CAMSTREAM_*` du processus (feature `env`) ; les tests de configuration vérifient qu'aucune
+n'est définie. C'est
 `app` qui convertit `AppConfig` en `HubCapacity`, `SupervisorSettings`, `MaxClients`.
 L'adresse d'écoute par défaut est `127.0.0.1:8080` ; l'image Docker fixe
 `CAMSTREAM_BIND=0.0.0.0` ([ADR 0007](adr/0007-securite-reseau-local-v1.md)). La liste des
 variables et leurs défauts figure dans [deploiement.md](deploiement.md#5-variables-denvironnement).
+
+### 3.8 `app` — racine de composition
+
+```rust
+//! Racine de composition : câble le hub, le superviseur de capture et le serveur.
+
+/// Issue du cycle de vie, traduite en code de sortie par `main` (0 si `Stopped`, 1 sinon).
+pub enum Outcome { Stopped, CaptureFailed, ServerFailed }
+
+/// Application non démarrée ; la fabrique est injectée (réelle ou scriptée en test).
+pub struct App { /* AppConfig, Box<dyn FrameSourceFactory> */ }
+
+impl App {
+    pub fn new(config: AppConfig) -> Self;                       // SourceFactory
+    pub fn with_factory(config: AppConfig, factory: Box<dyn FrameSourceFactory>) -> Self;
+    /// Crée hub, superviseur (jeton enfant) et serveur (jeton enfant), réserve le port.
+    /// Refuse un runtime `current_thread` (minuteries de `Handle::block_on`).
+    pub async fn bind(self) -> anyhow::Result<BoundApp>;
+}
+
+pub struct BoundApp { /* BoundServer, CaptureSupervisor, StatusReceiver, jeton racine */ }
+
+impl BoundApp {
+    pub fn local_addr(&self) -> SocketAddr;
+    pub fn status(&self) -> StatusReceiver;
+    /// Lance la capture et le serveur ; `select!` sur `shutdown` (signal), `Failed` ou
+    /// canal d'état fermé (fin anormale de la capture), fin du serveur ; puis annule le
+    /// jeton racine et attend serveur et capture en parallèle, jusqu'à `shutdown_timeout`.
+    pub async fn run(self, shutdown: impl Future<Output = ()>) -> anyhow::Result<Outcome>;
+}
+```
+
+`main.rs` installe les gestionnaires `SIGTERM`/`SIGINT` (`tokio::signal::unix`) et passe le futur
+correspondant à `run` ; les tests passent un `CancellationToken::cancelled_owned()`. Après
+`run`, `main` détruit le runtime avec `shutdown_timeout(500 ms)` : une tâche bloquante restante
+(join de la capture expiré) ne peut pas empêcher le processus de quitter.
 
 ## 4. Diagramme de classes
 
@@ -1035,6 +1209,8 @@ classDiagram
         Disconnected
         PermissionDenied
         UnsupportedFormat
+        NotACaptureDevice
+        SourceNotAvailable
         Timeout
         CorruptedFrame
         Io
@@ -1042,7 +1218,7 @@ classDiagram
     }
     class FrameHub {
         -sender broadcast_Sender
-        -demand ArcWatchSender
+        -demand watch_Sender
         +new(capacity) FrameHub
         +publish(frame) usize
         +subscribe() FrameSubscriber
@@ -1051,7 +1227,7 @@ classDiagram
     }
     class FrameSubscriber {
         -receiver broadcast_Receiver
-        -demand ArcWatchSender
+        -demand watch_Sender
         -skipped u64
         +next_frame() Option~Frame~
         +skipped_frames() u64
@@ -1102,7 +1278,25 @@ classDiagram
     }
     class Server {
         +router() Router
+        +bind() BoundServer
         +run() Result
+    }
+    class BoundServer {
+        +local_addr() SocketAddr
+        +serve() Result
+    }
+    class CaptureHandle {
+        +is_finished() bool
+        +join() Result
+    }
+    class App {
+        +new(config) App
+        +with_factory(config, factory) App
+        +bind() BoundApp
+    }
+    class BoundApp {
+        +local_addr() SocketAddr
+        +run(shutdown) Outcome
     }
     class ServerBuilder {
         +new(bind) ServerBuilder
@@ -1120,7 +1314,7 @@ classDiagram
     }
     class HealthReport {
         <<DTO serde>>
-        +status str
+        +status HealthState
         +camera CameraReport
         +clients usize
     }
@@ -1148,6 +1342,11 @@ classDiagram
     Server *-- ClientLimiter
     Server ..> HealthReport : sérialise
     HealthReport ..> SourceStatus : From
+    Server ..> BoundServer : bind
+    CaptureSupervisor ..> CaptureHandle : spawn
+    App ..> BoundApp : bind
+    BoundApp *-- BoundServer
+    BoundApp *-- CaptureSupervisor
 ```
 
 ## 5. Flux de données et séquences
@@ -1173,33 +1372,35 @@ pour être réutilisé). En repli YUYV, cette étape est remplacée par l'encoda
 sequenceDiagram
     autonumber
     participant Main as main.rs
-    participant Cfg as AppConfig
-    participant App as App
+    participant Cfg as Command
+    participant App as App / BoundApp
     participant Sup as CaptureSupervisor
     participant Srv as Server
     Main->>Cfg: load() depuis CLI et CAMSTREAM_*
-    Cfg-->>Main: AppConfig validée
-    Main->>Main: init tracing et CancellationToken racine
-    Main->>App: App::from_config(config, token)
-    App->>App: créer FrameHub et SourceFactory
-    App->>Sup: new(factory, hub, settings, Handle, token enfant)
-    App->>Srv: ServerBuilder ... build()
-    Main->>Sup: spawn() dans le thread camstream-capture
-    Sup->>Sup: sonde, créer puis détruire la source
+    Cfg-->>Main: Command::Serve(AppConfig) validée
+    Main->>Main: init tracing, runtime multi-thread, gestionnaires SIGTERM et SIGINT
+    Main->>App: App::new(config).bind()
+    App->>App: créer FrameHub, SourceFactory, jeton racine
+    App->>Sup: new(factory, hub, settings, Handle, jeton enfant)
+    App->>Srv: ServerBuilder ... build() puis bind(), port occupé = erreur, code 1
+    Main->>App: run(signal)
+    App->>Sup: spawn() dans le thread camstream-capture
+    App->>Srv: serve() dans une tâche tokio
+    Sup->>Sup: sonde, créer la source puis la détruire sauf abonnés présents
     alt erreur Fatal
-        Sup-->>Main: statut Failed
-        Main->>Main: annuler le jeton racine, sortie code 1
+        Sup-->>App: statut Failed
+        App->>App: annuler le jeton racine, Outcome CaptureFailed, code 1
     else sonde réussie ou webcam absente
-        Sup-->>Main: statut Idle
+        Sup-->>App: statut Idle
     end
-    Main->>Srv: run() sur le runtime tokio
-    Main->>Main: select sur SIGTERM, SIGINT, fin du serveur, statut Failed
+    App->>App: select sur signal, statut Failed ou canal fermé, fin du serveur
 ```
 
-Le `select!` final de `main` est le **seul** endroit qui décide de l'arrêt global : sur
-`Failed` (observé par `status.wait_for`), il annule le jeton racine puis suit la séquence
-du § 5.4 et sort en code 1 ([ADR 0004](adr/0004-distribution-des-trames-et-concurrence.md),
-décision 5).
+Le `select!` de `BoundApp::run` est le **seul** endroit qui décide de l'arrêt global : sur
+`Failed` (observé par `status.wait_for`) ou sur la fermeture du canal d'état sans `Failed`
+(fin anormale du thread), il annule le jeton racine puis suit la séquence du § 5.4 et renvoie
+`Outcome::CaptureFailed`, que `main` traduit en code 1
+([ADR 0004](adr/0004-distribution-des-trames-et-concurrence.md), décision 5).
 
 ### 5.3 Connexion d'un client et streaming
 
@@ -1262,7 +1463,7 @@ sequenceDiagram
         Sup->>Sup: drop de la source donc STREAMOFF et libération du périphérique
         Sup-->>Main: thread terminé
     end
-    Main->>Main: join borné par shutdown_timeout
+    Main->>Main: attente du serveur et join de la capture en parallèle, bornés par shutdown_timeout
     Main-->>D: exit 0
 ```
 
@@ -1273,9 +1474,9 @@ l'arrêt gracieux d'axum attendrait indéfiniment la fin des connexions longues.
 
 Ce `select!` ne suffit pas toujours : si l'écriture vers un client est bloquée (fenêtre TCP
 pleine, client disparu sans `RST`), hyper ne sonde plus le flux du corps et le jeton n'est
-jamais observé. Le futur `Server::run` doit donc lui aussi être borné par
-`tokio::time::timeout(shutdown_timeout, …)` dans `app`, au même titre que le join du thread de
-capture.
+jamais observé. `app` borne donc l'attente du serveur par la même échéance que le join du
+thread de capture (`tokio::time::timeout_at`), puis interrompt la tâche du serveur (`abort`)
+si l'échéance est dépassée.
 Les options `SO_KEEPALIVE` / `TCP_USER_TIMEOUT` (§ 3.6) réduisent ce cas en fonctionnement
 normal : un client disparu est déconnecté par le noyau au bout d'environ 30 s.
 
@@ -1337,16 +1538,17 @@ et les rechargements dans le délai de grâce, ne subissent pas cette latence.
 | `server` | `ServerError` | Remonte à `main` (port occupé → sortie code 1) |
 | Flux client | erreurs d'écriture socket | Fin silencieuse du flux (log `debug`), aucune propagation |
 | `config` | `ConfigError` | Message clair et sortie code 2 (`--help`/`--version` gérés par clap) |
+| Thread de capture | `CaptureThreadError` | `Fatal` (déjà signalée par `Failed`) ou `Panicked` (fin anormale, code 1) |
 | `main` / `app` | `anyhow::Error` | Contexte ajouté (`.context(...)`), log `error`, code de sortie non nul |
 
 Politique de reprise de la capture :
 
 | `CaptureError` | `Recovery` | Comportement |
 |---|---|---|
-| `CorruptedFrame` | `Skip` | Trame jetée, log `debug` |
+| `CorruptedFrame` (pas de `SOI`/`EOI`, tampon vide, drapeau `V4L2_BUF_FLAG_ERROR`) | `Skip` | Trame jetée, log `debug` |
 | `Timeout` | `Reopen` | Webcam figée : la source est détruite puis recréée (choix lié au comportement de `v4l` 0.14, § 3.5) |
-| `Disconnected`, `DeviceNotFound`, `Io` | `Reopen` | Statut `Reconnecting`, attente exponentielle (1 s, 2 s, 4 s… max 30 s), nouvel appel à la fabrique — **uniquement tant qu'il y a des abonnés** ; sinon `Idle` |
-| `PermissionDenied`, `UnsupportedFormat` (dont « pas de MJPEG » en v1) | `Fatal` | Statut `Failed`, fin du thread de capture avec l'erreur ; `main` l'observe (statut `watch` ou fin du thread) et annule le jeton racine, sortie code 1 (la politique `restart` de Docker prend le relais) |
+| `Disconnected`, `DeviceNotFound`, `Io` (dont `EINVAL`, `EBUSY`) | `Reopen` | Statut `Reconnecting`, attente exponentielle (1 s, 2 s, 4 s… max 30 s), nouvel appel à la fabrique — **uniquement tant qu'il y a des abonnés** ; sinon `Idle` |
+| `PermissionDenied`, `NotACaptureDevice`, `UnsupportedFormat` (dont « pas de MJPEG » en v1), `SourceNotAvailable` | `Fatal` | Statut `Failed`, fin du thread de capture avec l'erreur ; `main` l'observe (statut `watch` ou fin du thread) et annule le jeton racine, sortie code 1 (la politique `restart` de Docker prend le relais) |
 
 Le superviseur reçoit un jeton **enfant** (§ 5.2) : annuler un `child_token()` n'annule pas
 son parent. Le superviseur ne peut donc pas déclencher lui-même l'arrêt global ; c'est `main`
@@ -1376,7 +1578,7 @@ stateDiagram-v2
     Streaming --> Reconnecting : erreur Reopen, dont Timeout
     Streaming --> Failed : erreur Fatal
 
-    Reconnecting --> Streaming : create() réussi après attente
+    Reconnecting --> Streaming : create() réussi après attente, première trame
     Reconnecting --> Reconnecting : nouvel échec, attente doublée
     Reconnecting --> Idle : plus aucun abonné
     Reconnecting --> Failed : erreur Fatal
@@ -1387,11 +1589,42 @@ stateDiagram-v2
     Reconnecting --> Stopped : jeton annulé pendant l'attente
     Failed --> [*]
     Stopped --> [*]
+    note right of Failed
+        Atteint aussi depuis tout état
+        si le thread de capture panique
+    end note
 ```
 
 `Active` et `Grace` sont des sous-états internes du superviseur ; l'état publié reste
 `Streaming` dans les deux cas (la webcam est ouverte). `Starting` couvre la sonde initiale et
-chaque ouverture déclenchée par un premier abonné.
+chaque ouverture déclenchée par un premier abonné ; `Streaming` n'est publié qu'à la
+**première trame** (une source ouverte qui ne produit rien reste `Starting` ou `Reconnecting`).
+
+### 7.1 Décisions prises à l'implémentation (points ouverts de la revue)
+
+1. **Ordre sonde de démarrage / premier client.** Un client peut s'abonner pendant la sonde
+   (le serveur écoute avant le lancement du thread de capture). Décision : si des abonnés sont
+   présents à l'issue d'une sonde réussie, la source est **conservée** et sert directement
+   (pas de fermeture/réouverture qui ajouterait la latence d'ouverture au premier spectateur).
+   Si la sonde échoue avec une erreur `Reopen` alors que des abonnés attendent, la reconnexion
+   démarre aussitôt (`Reconnecting`, tentative 1) ; sans abonné, l'état passe à `Idle`. Testé
+   par `subscribers_present_at_startup_keep_the_probed_source` et
+   `missing_camera_at_startup_is_retried_only_with_viewers` (`tests/supervisor.rs`).
+2. **Fin du thread de capture sans `Failed` = fin anormale.** Une panique dans le thread de
+   capture (bogue, ou `Drop` de `v4l` paniquant hors de `Released<T>`) arrête l'application avec
+   le code 1, comme une erreur fatale : un thread de capture mort laisserait sinon un serveur
+   « sain » qui ne diffuse plus rien. Mise en œuvre en deux niveaux :
+   - un gardien RAII (`PanicGuard`, `stream/supervisor.rs`) publie
+     `Failed { reason: "capture thread panicked" }` pendant le déroulement de la panique :
+     `/health` passe à `503` et `app` réagit comme pour une erreur fatale ;
+   - par défense en profondeur, `app` traite aussi la **fermeture du canal d'état sans
+     `Failed`** comme une fin anormale, et `CaptureHandle::join` traduit la panique en
+     `CaptureThreadError::Panicked(message)` (code 1 même si l'arrêt avait été demandé).
+   Les paniques des `Drop` de `v4l` sont d'abord contenues dans l'adaptateur (`Released<T>`,
+   § 3.5) : la ressource est perdue de toute façon et la source sera recréée. Limite : une
+   double panique pendant un déroulement provoque un `abort` du processus (Docker redémarre le
+   conteneur). Le profil `release` garde `panic = "unwind"` (défaut), indispensable à ces
+   mécanismes.
 
 Règles :
 
@@ -1443,11 +1676,12 @@ et la cadence (10 à 15 i/s).
 ## 9. Observabilité
 
 - `tracing` avec `EnvFilter` (`RUST_LOG`, défaut `info`).
-- Un *span* par client (`client_id`, adresse distante) : `info` à la connexion et à la
-  déconnexion (durée, trames envoyées, trames sautées).
+- Champs structurés par client (`client_id`, `remote`) : `info` à la connexion et à la
+  déconnexion (durée, trames envoyées, trames sautées) ; `warn` au refus `503`.
 - `warn` à chaque perte de webcam et tentative de reconnexion, `info` au rétablissement.
 - `info` à l'allumage et à l'extinction de la webcam (capture à la demande), avec la durée
-  d'ouverture mesurée (latence du premier client).
+  d'ouverture (`elapsed_ms`) et le délai jusqu'à la première trame (`first_frame_ms`).
+- Couleurs ANSI seulement si la sortie est un terminal (`docker logs` reste lisible).
 - Aucune trace par trame au-dessus du niveau `trace`.
 
 ## 10. Évolutions prévues (non implémentées)
@@ -1459,3 +1693,23 @@ et la cadence (10 à 15 i/s).
 | `/snapshot.jpg` | Nécessite de conserver la dernière trame (un `watch<Option<Frame>>` en plus du hub) |
 | Authentification / TLS | Hors v1 ([ADR 0007](adr/0007-securite-reseau-local-v1.md)) : reverse proxy en amont ou VPN, nouvel ADR |
 | Conversion YUYV → JPEG | Phase 2 (feature `yuyv`) ; en v1, webcam sans MJPEG = erreur fatale explicite |
+
+## 11. Écarts entre la conception initiale et l'implémentation
+
+| Élément | Conception initiale | Implémentation | Raison |
+|---|---|---|---|
+| `CaptureError` | 7 variantes, `Io` avec `#[from]` | + `NotACaptureDevice` et `SourceNotAvailable` (fatales) ; `#[from]` retiré | Nœud de métadonnées `/dev/video1` (erreur de configuration fréquente, sinon reconnexion sans fin) ; binaire compilé sans `v4l2` ; traduction explicite des `errno` |
+| `CaptureHandle::join` | `Result<(), CaptureError>` | `Result<(), CaptureThreadError>` (`Fatal` / `Panicked`) | La panique est un concept de thread, pas une erreur de capture du domaine |
+| Panique du thread de capture | Point ouvert | `PanicGuard` publie `Failed` ; canal fermé sans `Failed` = fin anormale (§ 7.1) | Décision de la revue |
+| Sonde et abonnés présents | Point ouvert | Source conservée (§ 7.1) | Décision de la revue |
+| `Streaming` | Publié à l'ouverture de la source | Publié à la première trame | `/health` ne dit `streaming` que si des images circulent |
+| Demande du hub | `Arc<watch::Sender<usize>>` | `watch::Sender<usize>` cloné | `watch::Sender` est `Clone` (tokio ≥ 1.37) |
+| `Server` | `run()` | `bind()` → `BoundServer { local_addr(), serve() }` + `run()` | Connaître le port réel (port 0 en test) ; erreur `Bind` avant le lancement de la capture |
+| `AppConfig::load` | Renvoie `AppConfig` | `Command::load` renvoie `Serve(AppConfig)` ou `Healthcheck(HealthcheckConfig)` | Sous-commande `healthcheck` |
+| `app` | « `App::from_config` » | `App::new` / `App::with_factory`, `BoundApp::run(shutdown)`, `Outcome` | Fabrique et signal injectés : cycle de vie testable |
+| `MaxClients` | `server/mod.rs` | `server/mjpeg.rs`, réexporté | Proche de `ClientLimiter` qui l'utilise |
+| `TcpOptions` | 4 champs | + `nodelay` | `TCP_NODELAY` recommandé au § 3.6 |
+| `CameraReport` | `state`, `source`, `error` | + `attempt` (en `reconnecting`) | Diagnostic de la reconnexion |
+| Validation de la vidéo | Non précisée | `capture::jpeg::complete_jpeg_len` (`SOI`/`EOI`, bourrage) | Spike 0001 : bourrage et trames tronquées possibles |
+| `CAMSTREAM_JPEG_QUALITY` | Listée | Non implémentée | Repli YUYV en phase 2 |
+| Runtime `current_thread` | Mise en garde | Refusé par `App::bind` (erreur explicite) | `Handle::block_on` n'y ferait pas avancer les minuteries |

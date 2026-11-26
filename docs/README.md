@@ -1,6 +1,9 @@
 # Documentation Camstream
 
 Toute la documentation du projet est rédigée en français et les diagrammes sont faits en Mermaid.
+Présentation et démarrage rapide : [README du dépôt](../README.md). La v1 est implémentée ;
+les écarts avec la conception initiale sont listés dans
+[architecture § 11](architecture.md#11-écarts-entre-la-conception-initiale-et-limplémentation).
 
 | Document | Contenu |
 |---|---|

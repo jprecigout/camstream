@@ -1,0 +1,34 @@
+# Exemple de déploiement de Camstream sur un Raspberry Pi (voir docs/deploiement.md).
+# Réseau local uniquement : aucune authentification ni TLS en v1 (docs/adr/0007).
+services:
+  camstream:
+    image: ghcr.io/jprecigout/camstream:latest
+    # build: .                       # alternative : construire localement
+    restart: unless-stopped
+    init: true                       # récolte des zombies ; SIGTERM transmis à camstream
+    devices:
+      - "/dev/video0:/dev/video0"
+    group_add:
+      - "video"                      # ou le GID numérique : stat -c %g /dev/video0
+    ports:
+      - "192.168.1.20:8080:8080"     # adresse LAN du Pi uniquement (docs/deploiement.md § 9)
+    environment:
+      CAMSTREAM_DEVICE: /dev/video0
+      CAMSTREAM_RESOLUTION: 640x480
+      CAMSTREAM_FPS: "15"
+      CAMSTREAM_MAX_CLIENTS: "10"
+      CAMSTREAM_IDLE_TIMEOUT_MS: "10000"
+      # CAMSTREAM_SOURCE: synthetic   # mire de test, pour valider le déploiement sans webcam
+      RUST_LOG: info
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - "no-new-privileges:true"
+    stop_grace_period: 10s           # supérieur à CAMSTREAM_SHUTDOWN_TIMEOUT_MS (5 s)
+    mem_limit: 128m
+    cpus: 1.0
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"              # préserver la carte SD
+        max-file: "3"
