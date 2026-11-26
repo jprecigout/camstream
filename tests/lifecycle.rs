@@ -85,3 +85,29 @@ async fn shutdown_is_bounded_even_with_a_connected_viewer() {
     assert_eq!(within("stop", app.stop()).await, Outcome::Stopped);
     assert!(started.elapsed() < Duration::from_secs(3));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_blocked_beyond_the_shutdown_timeout_is_not_a_failure() {
+    // La configuration interdit désormais `read_timeout >= shutdown_timeout` ; ce test
+    // construit `AppConfig` directement pour vérifier la logique d'arrêt elle-même :
+    // un join expiré est journalisé mais ne transforme pas l'arrêt en échec (code 0).
+    let mut config = test_config();
+    config.shutdown_timeout = Duration::from_millis(300);
+    let (factory, _probe) = ScriptedFactory::new([], Duration::from_secs(1));
+    let mut app = TestApp::start(config, Some(factory)).await;
+    wait_status(&mut app.status, "Idle", |s| *s == SourceStatus::Idle).await;
+    // Un spectateur fait ouvrir la source, dont la lecture bloque 1 s.
+    let mut status = app.status.clone();
+    let addr = app.addr;
+    let _viewer = tokio::spawn(async move { get(addr, "/stream.mjpg").await });
+    wait_status(&mut status, "Starting", |s| *s == SourceStatus::Starting).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let started = tokio::time::Instant::now();
+    assert_eq!(app.stop().await, Outcome::Stopped);
+    assert!(
+        started.elapsed() < Duration::from_millis(1500),
+        "{:?}",
+        started.elapsed()
+    );
+}

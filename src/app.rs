@@ -79,6 +79,7 @@ impl App {
         let settings = SupervisorSettings {
             backoff: BackoffPolicy::new(config.reconnect_initial, config.reconnect_max),
             idle_timeout: config.idle_timeout,
+            max_corrupted_frames: config.max_corrupted_frames,
         };
         // Jetons enfants : ni le serveur ni la capture ne peuvent arrêter l'application ;
         // seul `run` annule le jeton racine (ADR 0004, décision 5).
@@ -237,7 +238,13 @@ async fn stop_server(
 enum CaptureEnd {
     /// Terminé normalement, ou erreur fatale déjà signalée par l'état `Failed`.
     Expected,
-    /// Panique ou absence de fin dans le délai.
+    /// Pas terminé dans le délai (lecture bloquée) : journalisé, sans changer l'issue.
+    ///
+    /// Une lecture bloquée n'est pas un défaut de la capture : la configuration
+    /// garantit `read_timeout < shutdown_timeout`, et le processus quitte de toute
+    /// façon. Compter ce cas comme un échec donnerait un faux code 1 à l'arrêt.
+    TimedOut,
+    /// Panique du thread de capture : code 1 même si l'arrêt avait été demandé.
     Abnormal,
 }
 
@@ -263,7 +270,7 @@ async fn stop_capture(capture: CaptureHandle, deadline: Instant) -> CaptureEnd {
         Err(_) => {
             // Lecture V4L2 bloquée au-delà du délai : le processus va quitter quand même.
             tracing::warn!("capture thread did not stop within the shutdown timeout");
-            CaptureEnd::Abnormal
+            CaptureEnd::TimedOut
         }
     }
 }

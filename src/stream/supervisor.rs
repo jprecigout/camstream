@@ -8,6 +8,7 @@
 //! l'arrêt reste immédiat.
 
 use std::any::Any;
+use std::num::NonZeroU32;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -75,14 +76,30 @@ pub struct SupervisorSettings {
     /// Délai de grâce avant d'éteindre la webcam après le départ du dernier client
     /// (`Duration::ZERO` : arrêt immédiat).
     pub idle_timeout: Duration,
+    /// Nombre de trames invalides **consécutives** au-delà duquel la source est
+    /// considérée défaillante et rouverte (`CaptureError::CorruptedStream`). Le
+    /// compteur repart de zéro à chaque trame valide.
+    pub max_corrupted_frames: NonZeroU32,
+}
+
+impl SupervisorSettings {
+    /// Seuil par défaut de trames invalides consécutives : 30 (≈ 2 s à 15 i/s, l'ordre
+    /// de grandeur du délai de lecture par défaut).
+    // Invariant vérifié à la compilation : la constante 30 est non nulle.
+    pub const DEFAULT_MAX_CORRUPTED_FRAMES: NonZeroU32 = match NonZeroU32::new(30) {
+        Some(max) => max,
+        None => panic!("30 is not zero"),
+    };
 }
 
 impl Default for SupervisorSettings {
-    /// Attente exponentielle 1 s → 30 s, délai de grâce de 10 s (ADR 0006).
+    /// Attente exponentielle 1 s → 30 s, délai de grâce de 10 s (ADR 0006), 30 trames
+    /// invalides consécutives au plus.
     fn default() -> Self {
         Self {
             backoff: BackoffPolicy::DEFAULT,
             idle_timeout: Duration::from_secs(10),
+            max_corrupted_frames: Self::DEFAULT_MAX_CORRUPTED_FRAMES,
         }
     }
 }
@@ -308,6 +325,10 @@ impl CaptureSupervisor {
         let opened_at = Instant::now();
         let mut streaming = false;
         let mut frames: u64 = 0;
+        // Trames invalides depuis la dernière trame valide : une source qui ne produit
+        // plus que des trames corrompues est rouverte au lieu d'être lue indéfiniment.
+        let mut corrupted: u32 = 0;
+        let max_corrupted = self.settings.max_corrupted_frames.get();
         // Échéance du délai de grâce, armée quand la demande tombe à zéro. Vérifiée
         // entre deux trames, donc avec une précision ≤ délai de lecture.
         let mut grace_deadline: Option<Instant> = None;
@@ -337,6 +358,7 @@ impl CaptureSupervisor {
                 Ok(frame) => {
                     self.hub.publish(frame);
                     frames += 1;
+                    corrupted = 0;
                     *attempt = 0;
                     if !streaming {
                         streaming = true;
@@ -348,7 +370,15 @@ impl CaptureSupervisor {
                     }
                 }
                 Err(error) => match error.recovery() {
-                    Recovery::Skip => tracing::debug!(error = %error, "frame skipped"),
+                    Recovery::Skip => {
+                        corrupted = corrupted.saturating_add(1);
+                        tracing::debug!(error = %error, consecutive = corrupted, "frame skipped");
+                        if corrupted >= max_corrupted {
+                            break StreamEnd::Lost(CaptureError::CorruptedStream {
+                                consecutive: corrupted,
+                            });
+                        }
+                    }
                     Recovery::Reopen => break StreamEnd::Lost(error),
                     Recovery::Fatal => break StreamEnd::Fatal(error),
                 },
@@ -528,6 +558,7 @@ mod tests {
     #[test]
     fn default_settings_match_the_documentation() {
         let settings = SupervisorSettings::default();
+        assert_eq!(settings.max_corrupted_frames.get(), 30);
         assert_eq!(settings.idle_timeout, Duration::from_secs(10));
         assert_eq!(settings.backoff.initial(), Duration::from_secs(1));
         assert_eq!(settings.backoff.max(), Duration::from_secs(30));

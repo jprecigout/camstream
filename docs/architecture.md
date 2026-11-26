@@ -69,14 +69,19 @@ src/
 │       ├── device.rs    # V4l2Device<S> (Typestate) : Opened -> Configured -> V4l2Source
 │       ├── source.rs    # V4l2Source : impl FrameSource (Adapter, RAII)
 │       ├── errno.rs     # map_open_error, map_io_error (traduction des errno)
+│       ├── guard.rs     # guarded() : appels v4l sous catch_unwind -> DriverFault
 │       └── release.rs   # Released<T> : Drop de v4l sous catch_unwind (RAII)
 ├── server/              # ADAPTATEUR HTTP (axum)
 │   ├── mod.rs           # ServerBuilder, Server, BoundServer, ServerError
-│   ├── routes.rs        # routeur : /, /stream.mjpg, /health ; ServerState (privé)
+│   ├── routes.rs        # routeur : /, /camstream.js, /camstream.css, /stream.mjpg, /health
+│   │                    # ServerState (privé) ; couche d'en-têtes de sécurité
+│   ├── security.rs      # add_security_headers (nosniff, CSP, X-Frame-Options, Referrer-Policy)
 │   ├── mjpeg.rs         # corps multipart en streaming, MaxClients, ClientLimiter (Semaphore, RAII)
 │   ├── health.rs        # HealthReport (DTO serde) + client healthcheck (sous-commande)
 │   ├── net.rs           # TcpOptions, apply_tcp_options (keepalive, TCP_USER_TIMEOUT, NODELAY)
-│   └── index.html       # page minimale (include_str!)
+│   ├── index.html       # page minimale (include_str!), sans code en ligne (CSP)
+│   ├── camstream.js     # script de la page (masque l'attente, relance le flux)
+│   └── camstream.css    # style de la page
 └── config/              # lecture et validation de la configuration
     ├── mod.rs           # Command (Serve / Healthcheck), AppConfig, HealthcheckConfig, ConfigError
     └── cli.rs           # Cli (clap derive + env), enums miroirs SourceArg / FormatArg
@@ -85,7 +90,10 @@ tests/
 ├── support/mod.rs       # ScriptedFactory / ScriptedSource, TestApp, client HTTP, MultipartReader
 ├── supervisor.rs        # capture à la demande, grâce, reconnexion, Fatal, panique, arrêt
 ├── http.rs              # bout en bout : page, multipart, 503, /health, healthcheck, arrêt
-└── lifecycle.rs         # codes de sortie : arrêt, erreur fatale, panique, runtime refusé
+├── lifecycle.rs         # codes de sortie : arrêt, erreur fatale, panique, lecture bloquée
+├── security.rs          # en-têtes de sécurité sur toutes les réponses, page compatible CSP
+├── healthcheck.rs       # binaire `camstream healthcheck` : sain 0, failed 1, absent 1
+└── slow_client.rs       # client qui ne lit plus : trames sautées, capture non bloquée
 
 assets/synthetic/        # 10 images JPEG 640x480 de la mire (scripts/generate_synthetic_frames.py)
 ```
@@ -391,6 +399,12 @@ pub enum CaptureError {
     /// Trame invalide (JPEG tronqué, tampon vide, drapeau d'erreur du pilote) : on la jette.
     #[error("corrupted frame")]
     CorruptedFrame,
+    /// Trop de trames invalides consécutives (produite par le superviseur) : Reopen.
+    #[error("{consecutive} consecutive corrupted frames")]
+    CorruptedStream { consecutive: u32 },
+    /// Panique interceptée dans la bibliothèque d'accès au pilote : Reopen (§ 7.2).
+    #[error("video driver library failed during {operation}: {message}")]
+    DriverFault { operation: &'static str, message: String },
     /// Autre erreur d'entrée/sortie du pilote (dont `EINVAL`, `EBUSY`).
     #[error("video I/O error")]
     Io(#[source] std::io::Error),
@@ -577,7 +591,8 @@ impl BackoffPolicy {
 }
 
 /// Réglages du superviseur, regroupés pour garder un constructeur lisible.
-/// `Default` : attente exponentielle 1 s → 30 s, délai de grâce 10 s.
+/// `Default` : attente exponentielle 1 s → 30 s, délai de grâce 10 s, 30 trames
+/// invalides consécutives au plus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SupervisorSettings {
     /// Attente entre deux tentatives de reconnexion.
@@ -585,6 +600,9 @@ pub struct SupervisorSettings {
     /// Délai de grâce avant d'éteindre la webcam après le départ du dernier client
     /// (`Duration::ZERO` : arrêt immédiat).
     pub idle_timeout: Duration,
+    /// Trames invalides consécutives au-delà desquelles la source est rouverte
+    /// (`CaptureError::CorruptedStream`) ; compteur remis à zéro à chaque trame valide.
+    pub max_corrupted_frames: NonZeroU32,
 }
 
 /// Superviseur de capture : capture à la demande, boucle de lecture, reconnexion.
@@ -672,7 +690,9 @@ boucle :
                        -> drop(source), tentative = 0, retour à l'acquisition (Idle)
         demande > 0  : désarmer l'échéance
         next_frame() -> publish ; tentative = 0 ; statut Streaming à la première trame
-        erreur Skip -> ignorer ; Reopen -> drop(source), comme un échec de create() ;
+        erreur Skip -> ignorer, corrompues += 1 ; corrompues >= max_corrupted_frames
+                       -> Reopen avec CorruptedStream (corrompues = 0 à chaque trame valide) ;
+        Reopen -> drop(source), comme un échec de create() ;
         Fatal -> drop(source), Failed, fin
 jeton annulé à tout moment -> drop(source), statut Stopped, fin
 panique à tout moment -> PanicGuard : statut Failed (« capture thread panicked »), fin du thread
@@ -802,6 +822,11 @@ pub struct V4l2Source {
 /// Ressource `v4l` détruite sous `catch_unwind` (**RAII**) : une panique d'un `Drop` de
 /// `v4l` est journalisée au lieu d'arrêter le thread de capture.
 pub(crate) struct Released<T> { value: Option<T>, what: &'static str }
+
+/// Appel à `v4l` (ouverture, `query_caps`, `set_format`, `set_params`, allocation mmap,
+/// lecture) sous `catch_unwind` : une panique devient `CaptureError::DriverFault` (§ 7.2).
+pub(crate) fn guarded<T>(operation: &'static str,
+    call: impl FnOnce() -> Result<T, CaptureError>) -> Result<T, CaptureError>;
 
 /// Ouvre, configure et démarre une webcam (utilisé par `SourceFactory`).
 pub fn open_source(settings: &CaptureSettings) -> Result<V4l2Source, CaptureError>;
@@ -985,6 +1010,8 @@ impl HealthReport {
 
 /// Client de la sous-commande `camstream healthcheck` (bibliothèque standard, bloquant).
 pub fn healthcheck_target(bind: IpAddr, port: u16) -> SocketAddr; // 0.0.0.0 -> 127.0.0.1, :: -> ::1
+/// `timeout` borne la durée **totale** (connexion, envoi, lecture morceau par morceau
+/// avec délai recalculé) : défaut 2 s, sous le `--timeout=3s` du `HEALTHCHECK` Docker.
 pub fn check(addr: SocketAddr, timeout: Duration) -> Result<(), HealthcheckError>;
 
 /// Échec de la sonde : `Connect`, `Io`, `InvalidResponse`, `Unhealthy(code)`.
@@ -1009,10 +1036,27 @@ Routes :
 
 | Route | Réponse |
 |---|---|
-| `GET /` | Page HTML minimale (`<img src="/stream.mjpg">`, texte « Démarrage de la caméra… » jusqu'au premier `onload`, quelques lignes de JS pour recharger l'image si la connexion tombe) |
+| `GET /` | Page HTML minimale (`<img src="/stream.mjpg">`, texte « Démarrage de la caméra… » jusqu'à la première image), **sans script ni style en ligne** (CSP) |
+| `GET /camstream.js` | Script de la page (`text/javascript`) : masque l'attente, relance le flux si la connexion tombe |
+| `GET /camstream.css` | Style de la page (`text/css`) |
 | `GET /stream.mjpg` | `200`, `multipart/x-mixed-replace; boundary=frame`, `Cache-Control: no-cache, no-store, must-revalidate`, corps infini ; `503` (avec `Retry-After: 5`) si `MaxClients` atteint |
 | `GET /health` | JSON `HealthReport`, ex. `{"status":"ok","camera":{"state":"idle"},"clients":0}` ; `200` dans tous les états sauf `failed` → `503` |
 | autre | `404` ; méthode autre que `GET`/`HEAD` sur une route connue : `405` |
+
+En-têtes de sécurité ajoutés à **toutes** les réponses, `404`/`405`/`503` compris
+(`server::security::add_security_headers`, couche `map_response` posée après le routage ;
+un en-tête déjà défini par un handler n'est pas écrasé) :
+
+| En-tête | Valeur | Rôle |
+|---|---|---|
+| `X-Content-Type-Options` | `nosniff` | Jamais d'interprétation selon un type deviné (d'où les types MIME exacts du script et du style) |
+| `Content-Security-Policy` | `default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'` | Seuls le script, le style et le flux de même origine sont permis ; aucun code en ligne, aucun cadre |
+| `X-Frame-Options` | `DENY` | `frame-ancestors` pour les navigateurs anciens |
+| `Referrer-Policy` | `no-referrer` | L'adresse du Pi ne fuit pas vers un site tiers |
+
+Un script en ligne autorisé par empreinte (`'sha256-…'`) a été écarté : l'empreinte serait à
+recalculer à chaque modification de la page, sans outil dans le projet pour le vérifier ; deux
+petits fichiers servis par le binaire (`include_str!`) sont plus simples et testables.
 
 Format d'une partie MJPEG (deux `Bytes` émis successivement, sans copie du JPEG) :
 
@@ -1136,8 +1180,11 @@ pub enum ConfigError {
 par son `FromStr`. Les commentaires `///` des options sont en français (règle du projet) et
 le texte d'aide, technique, est donné en anglais par l'attribut `help`. Validation
 (`ConfigError::Invalid`, code de sortie 2) : `--format yuyv` refusé en v1, délai de lecture
-supérieur à l'intervalle entre images, `--hub-capacity` ≤ 64, `--reconnect-max-ms` ≥
-`--reconnect-initial-ms`. À noter : `try_parse_from` lit quand même les variables
+supérieur à l'intervalle entre images **et strictement inférieur au délai d'arrêt**
+(`--read-timeout-ms` < `--shutdown-timeout-ms`, § 5.4), `--hub-capacity` ≤ 64,
+`--max-clients` ≤ 1000, `--reconnect-max-ms` ≥ `--reconnect-initial-ms`.
+`--max-corrupted-frames` (`CAMSTREAM_MAX_CORRUPTED_FRAMES`, défaut 30, ≥ 1) règle le seuil de
+trames invalides consécutives. À noter : `try_parse_from` lit quand même les variables
 `CAMSTREAM_*` du processus (feature `env`) ; les tests de configuration vérifient qu'aucune
 n'est définie. C'est
 `app` qui convertit `AppConfig` en `HubCapacity`, `SupervisorSettings`, `MaxClients`.
@@ -1213,6 +1260,8 @@ classDiagram
         SourceNotAvailable
         Timeout
         CorruptedFrame
+        CorruptedStream
+        DriverFault
         Io
         +recovery() Recovery
     }
@@ -1480,6 +1529,13 @@ si l'échéance est dépassée.
 Les options `SO_KEEPALIVE` / `TCP_USER_TIMEOUT` (§ 3.6) réduisent ce cas en fonctionnement
 normal : un client disparu est déconnecté par le noyau au bout d'environ 30 s.
 
+Côté capture, le thread n'observe le jeton qu'**entre deux lectures** : une lecture en cours
+peut durer jusqu'à `read_timeout`. La configuration impose donc
+`read_timeout < shutdown_timeout` (code 2 sinon), pour qu'une webcam figée n'empêche pas le
+join dans le délai. Si le join expire malgré tout (destruction de la source anormalement
+lente), c'est journalisé en `warn` **sans changer l'issue** : un arrêt demandé reste un code 0.
+Seule une panique du thread transforme l'issue en échec (§ 7.1).
+
 ### 5.5 Capture à la demande : premier client, rechargement, dernier départ
 
 ```mermaid
@@ -1545,7 +1601,9 @@ Politique de reprise de la capture :
 
 | `CaptureError` | `Recovery` | Comportement |
 |---|---|---|
-| `CorruptedFrame` (pas de `SOI`/`EOI`, tampon vide, drapeau `V4L2_BUF_FLAG_ERROR`) | `Skip` | Trame jetée, log `debug` |
+| `CorruptedFrame` (pas de `SOI`/`EOI`, tampon vide, drapeau `V4L2_BUF_FLAG_ERROR`) | `Skip` | Trame jetée, log `debug` ; au-delà de `max_corrupted_frames` trames invalides **consécutives** (défaut 30), le superviseur produit `CorruptedStream` |
+| `CorruptedStream` | `Reopen` | Source rouverte comme après une déconnexion (§ 7.2) |
+| `DriverFault` (panique de `v4l` interceptée) | `Reopen` | Source abandonnée puis recréée avec attente exponentielle (§ 7.2) |
 | `Timeout` | `Reopen` | Webcam figée : la source est détruite puis recréée (choix lié au comportement de `v4l` 0.14, § 3.5) |
 | `Disconnected`, `DeviceNotFound`, `Io` (dont `EINVAL`, `EBUSY`) | `Reopen` | Statut `Reconnecting`, attente exponentielle (1 s, 2 s, 4 s… max 30 s), nouvel appel à la fabrique — **uniquement tant qu'il y a des abonnés** ; sinon `Idle` |
 | `PermissionDenied`, `NotACaptureDevice`, `UnsupportedFormat` (dont « pas de MJPEG » en v1), `SourceNotAvailable` | `Fatal` | Statut `Failed`, fin du thread de capture avec l'erreur ; `main` l'observe (statut `watch` ou fin du thread) et annule le jeton racine, sortie code 1 (la politique `restart` de Docker prend le relais) |
@@ -1625,6 +1683,42 @@ chaque ouverture déclenchée par un premier abonné ; `Streaming` n'est publié
    double panique pendant un déroulement provoque un `abort` du processus (Docker redémarre le
    conteneur). Le profil `release` garde `panic = "unwind"` (défaut), indispensable à ces
    mécanismes.
+
+### 7.2 Robustesse après la revue de la v1
+
+1. **Paniques de `v4l` hors `Drop`.** `v4l` 0.14 panique aussi en dehors de ses `Drop` :
+   `Capabilities::from` (`from_utf8(..).unwrap()` sur un nom de carte tronqué au milieu d'un
+   caractère UTF-8), `Format::from` (`expect` sur un espace colorimétrique ou un champ inconnu
+   d'un noyau plus récent que les bindings), `v4l2::open` (`CString::new(..).unwrap()`), la
+   destruction de l'`Arena` quand `MmapStream::with_buffers` échoue en cours d'allocation, ou
+   l'indexation des métadonnées par un index de tampon inattendu. Chaque appel à `v4l` de
+   l'adaptateur passe donc par `capture::v4l2::guard::guarded`, qui intercepte la panique
+   (`catch_unwind`) et la convertit en `CaptureError::DriverFault { operation, message }`.
+   Contourner `query_caps` n'est pas possible sans `ioctl` direct, donc sans `unsafe`, interdit.
+   **Choix `Reopen` plutôt que `Fatal`**, bien qu'un nom de carte invalide soit permanent :
+   - la reprise n'a lieu qu'**en présence de spectateurs**, avec attente exponentielle
+     plafonnée à 30 s : le coût d'une cause permanente est négligeable ;
+   - l'erreur reste visible (`/health` : `reconnecting` avec le message ; log `error`) ;
+   - `Fatal` donnerait code 1 puis une boucle de redémarrage Docker qui ne répare rien et
+     rend le service indisponible, alors qu'une autre webcam branchée sur le même nœud, ou
+     une panique transitoire (`munmap` en `EIO` pendant un débranchement), se rétablit seule.
+
+   Limites : l'état laissé par la panique n'est jamais réutilisé (la source est abandonnée),
+   mais une `Arena` dont la destruction a paniqué peut laisser des tampons mmap non libérés
+   (fuite bornée au nombre de pannes) ; une double panique reste un `abort`.
+2. **Trames corrompues en continu.** `CorruptedFrame` reste `Skip` pour une trame isolée,
+   mais le superviseur compte les trames invalides **consécutives** ; au seuil
+   `max_corrupted_frames` (`CAMSTREAM_MAX_CORRUPTED_FRAMES`, défaut **30**, soit ≈ 2 s à
+   15 i/s, du même ordre que le délai de lecture), il produit
+   `CaptureError::CorruptedStream { consecutive }` (`Reopen`) : la webcam est rouverte au lieu
+   de produire indéfiniment des images inutilisables. Le compteur repart de zéro à chaque
+   trame valide. Configurable, car le taux d'erreurs dépend de la webcam et du bus USB.
+3. **Arrêt et délai de lecture.** Voir § 5.4 : `read_timeout < shutdown_timeout` validé au
+   démarrage, et un join expiré ne transforme plus un arrêt demandé en code 1.
+4. **`panic = "unwind"` exigé à la compilation.** `Released<T>`, `guarded` et `PanicGuard`
+   reposent sur le déroulement des paniques ; `src/lib.rs` contient un `compile_error!` sous
+   `#[cfg(panic = "abort")]` pour qu'un profil `panic = "abort"` ne les rende pas inopérants
+   en silence.
 
 Règles :
 
@@ -1713,3 +1807,9 @@ et la cadence (10 à 15 i/s).
 | Validation de la vidéo | Non précisée | `capture::jpeg::complete_jpeg_len` (`SOI`/`EOI`, bourrage) | Spike 0001 : bourrage et trames tronquées possibles |
 | `CAMSTREAM_JPEG_QUALITY` | Listée | Non implémentée | Repli YUYV en phase 2 |
 | Runtime `current_thread` | Mise en garde | Refusé par `App::bind` (erreur explicite) | `Handle::block_on` n'y ferait pas avancer les minuteries |
+| Paniques de `v4l` hors `Drop` | Non traitées | `guarded()` → `CaptureError::DriverFault` (`Reopen`) | Revue v1 (§ 7.2) |
+| Trames corrompues en continu | `Skip` sans limite | `CorruptedStream` (`Reopen`) après `max_corrupted_frames` consécutives (défaut 30, configurable) | Revue v1 (§ 7.2) |
+| `read_timeout` / `shutdown_timeout` | Indépendants | `read_timeout < shutdown_timeout` validé (code 2) ; join expiré = `warn`, issue inchangée | Faux code 1 à l'arrêt (revue v1) |
+| En-têtes HTTP | Non prévus | `nosniff`, CSP stricte, `X-Frame-Options`, `Referrer-Policy` sur toutes les réponses ; script et style de la page servis à part | Revue v1 (ADR 0007) |
+| Délai de `camstream healthcheck` | Par étape | Total (2 s par défaut < 3 s du `HEALTHCHECK`) | Le pire cas dépassait le délai de Docker (revue v1) |
+| `panic = "abort"` | Non traité | `compile_error!` | Revue v1 (§ 7.2) |

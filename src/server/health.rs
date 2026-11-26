@@ -1,9 +1,9 @@
 //! Santé de l'application : DTO JSON de `/health`, handler, et client minimal
 //! utilisé par la sous-commande `camstream healthcheck` (HEALTHCHECK Docker).
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::extract::State;
 use axum::http::{header, StatusCode};
@@ -188,14 +188,21 @@ pub fn healthcheck_target(bind: IpAddr, port: u16) -> SocketAddr {
     SocketAddr::new(ip, port)
 }
 
+/// Taille maximale lue pour trouver la ligne de statut.
+const MAX_STATUS_LINE: usize = 1024;
+
 /// Interroge `GET /health` avec la bibliothèque standard (pas de `curl` dans l'image)
-/// et réussit si le code HTTP est 200. Bloquant, chaque étape bornée par `timeout`.
+/// et réussit si le code HTTP est 200. Bloquant.
+///
+/// `timeout` borne la **durée totale** de la sonde (connexion, envoi, lecture), et non
+/// chaque étape : il doit rester inférieur au `--timeout` du `HEALTHCHECK` Docker
+/// (2 s par défaut contre 3 s), sinon Docker tuerait la sonde avant qu'elle conclue.
 pub fn check(addr: SocketAddr, timeout: Duration) -> Result<(), HealthcheckError> {
+    let deadline = Instant::now() + timeout;
     let mut stream = TcpStream::connect_timeout(&addr, timeout)
         .map_err(|source| HealthcheckError::Connect { addr, source })?;
     stream
-        .set_read_timeout(Some(timeout))
-        .and_then(|()| stream.set_write_timeout(Some(timeout)))
+        .set_write_timeout(Some(remaining(deadline)?))
         .map_err(HealthcheckError::Io)?;
     write!(
         stream,
@@ -203,18 +210,44 @@ pub fn check(addr: SocketAddr, timeout: Duration) -> Result<(), HealthcheckError
     )
     .map_err(HealthcheckError::Io)?;
 
-    // Seule la ligne de statut compte ; lecture bornée à 1 Kio.
-    let mut status_line = String::new();
-    BufReader::new(std::io::Read::take(&mut stream, 1024))
-        .read_line(&mut status_line)
-        .map_err(HealthcheckError::Io)?;
-    let code = parse_status_code(&status_line)
-        .ok_or_else(|| HealthcheckError::InvalidResponse(status_line.trim_end().to_owned()))?;
+    // Lecture morceau par morceau jusqu'à la fin de la ligne de statut ; le délai de
+    // lecture est recalculé avant chaque `read` pour qu'un serveur qui répond octet par
+    // octet ne puisse pas prolonger la sonde au-delà de l'échéance.
+    let mut response = Vec::with_capacity(128);
+    let mut chunk = [0_u8; 256];
+    while !response.contains(&b'\n') && response.len() < MAX_STATUS_LINE {
+        stream
+            .set_read_timeout(Some(remaining(deadline)?))
+            .map_err(HealthcheckError::Io)?;
+        let read = stream.read(&mut chunk).map_err(HealthcheckError::Io)?;
+        if read == 0 {
+            break;
+        }
+        response.extend_from_slice(&chunk[..read]);
+    }
+    let status_line = String::from_utf8_lossy(&response);
+    let status_line = status_line.lines().next().unwrap_or_default();
+    let code = parse_status_code(status_line)
+        .ok_or_else(|| HealthcheckError::InvalidResponse(status_line.to_owned()))?;
     if code == 200 {
         Ok(())
     } else {
         Err(HealthcheckError::Unhealthy(code))
     }
+}
+
+/// Temps restant avant l'échéance ; erreur `TimedOut` si elle est dépassée (une durée
+/// nulle désactiverait le délai des sockets au lieu de l'appliquer).
+fn remaining(deadline: Instant) -> Result<Duration, HealthcheckError> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|left| !left.is_zero())
+        .ok_or_else(|| {
+            HealthcheckError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "health check deadline exceeded",
+            ))
+        })
 }
 
 /// Extrait le code d'une ligne de statut (`HTTP/1.1 200 OK` → 200).
@@ -305,6 +338,82 @@ mod tests {
         );
         assert_eq!(parse_status_code("SSH-2.0-OpenSSH"), None);
         assert_eq!(parse_status_code(""), None);
+    }
+
+    /// Serveur de test : accepte une connexion, lit la requête entière, applique
+    /// `behaviour`, puis attend que le client ferme.
+    ///
+    /// Lire toute la requête avant de répondre et ne pas fermer le premier évite un
+    /// `RST` (fermeture avec des données non lues) qui masquerait la réponse.
+    fn fake_server(behaviour: fn(&mut TcpStream)) -> SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 512];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => return,
+                    Ok(read) => request.extend_from_slice(&chunk[..read]),
+                }
+            }
+            behaviour(&mut stream);
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            while matches!(stream.read(&mut chunk), Ok(read) if read > 0) {}
+        });
+        addr
+    }
+
+    #[test]
+    fn healthcheck_accepts_200_and_rejects_503() {
+        let ok = fake_server(|s| {
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n");
+        });
+        check(ok, Duration::from_secs(2)).unwrap();
+        let failed = fake_server(|s| {
+            let _ = s.write_all(b"HTTP/1.1 503 Service Unavailable\r\n\r\n");
+        });
+        let error = check(failed, Duration::from_secs(2)).unwrap_err();
+        assert!(matches!(error, HealthcheckError::Unhealthy(503)), "{error}");
+    }
+
+    #[test]
+    fn a_silent_server_cannot_exceed_the_total_timeout() {
+        let addr = fake_server(|_| std::thread::sleep(Duration::from_secs(3)));
+        let started = Instant::now();
+        let error = check(addr, Duration::from_millis(300)).unwrap_err();
+        assert!(matches!(error, HealthcheckError::Io(_)), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_trickling_server_cannot_exceed_the_total_timeout() {
+        // Un octet toutes les 100 ms : chaque `read` réussit, mais la ligne de statut
+        // n'arrive jamais avant l'échéance globale.
+        let addr = fake_server(|stream| {
+            for byte in b"HTTP/1.1 200 OK, but very slowly".iter() {
+                if stream.write_all(&[*byte]).is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+        let started = Instant::now();
+        let error = check(addr, Duration::from_millis(500)).unwrap_err();
+        assert!(matches!(error, HealthcheckError::Io(_)), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

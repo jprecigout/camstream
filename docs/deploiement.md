@@ -122,7 +122,9 @@ ENV CAMSTREAM_BIND=0.0.0.0 \
 EXPOSE 8080
 STOPSIGNAL SIGTERM
 
-# Sonde sans curl : le binaire interroge lui-même /health sur 127.0.0.1.
+# Sonde sans curl : le binaire interroge lui-même /health sur 127.0.0.1. Sa durée
+# totale est bornée par CAMSTREAM_HEALTHCHECK_TIMEOUT_MS (2 s par défaut), inférieure
+# au --timeout de 3 s : la sonde conclut toujours (code 0 ou 1) avant que Docker la tue.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
     CMD ["/usr/local/bin/camstream", "healthcheck"]
 
@@ -251,7 +253,8 @@ l'environnement. Les valeurs invalides provoquent un arrêt immédiat avec un me
 | `CAMSTREAM_RESOLUTION` | `--resolution` | `640x480` | Résolution demandée (`LARGEURxHAUTEUR`) |
 | `CAMSTREAM_FPS` | `--fps` | `15` | Cadence demandée (1 à 120) |
 | `CAMSTREAM_FORMAT` | `--format` | `auto` | `auto`, `mjpeg`, `yuyv`. En v1, MJPEG est obligatoire : `auto` équivaut à `mjpeg` (webcam sans MJPEG → erreur fatale) et `yuyv` est refusé ; le repli YUYV arrive en phase 2 |
-| `CAMSTREAM_READ_TIMEOUT_MS` | `--read-timeout-ms` | `2000` | Délai maximal d'attente d'une trame ; au-delà, la webcam est considérée figée et rouverte (doit dépasser l'intervalle entre images) |
+| `CAMSTREAM_READ_TIMEOUT_MS` | `--read-timeout-ms` | `2000` | Délai maximal d'attente d'une trame ; au-delà, la webcam est considérée figée et rouverte (doit dépasser l'intervalle entre images **et rester inférieur à `CAMSTREAM_SHUTDOWN_TIMEOUT_MS`**, sinon code 2) |
+| `CAMSTREAM_MAX_CORRUPTED_FRAMES` | `--max-corrupted-frames` | `30` | Trames invalides (JPEG tronqué, erreur du pilote) **consécutives** tolérées avant de rouvrir la webcam (≈ 2 s à 15 i/s) ; le compteur repart de zéro à chaque trame valide |
 | `CAMSTREAM_IDLE_TIMEOUT_MS` | `--idle-timeout-ms` | `10000` | Délai de grâce avant d'éteindre la webcam quand plus aucun client ne regarde (`0` : immédiat) |
 | `CAMSTREAM_BIND` | `--bind` | `127.0.0.1` (image Docker : `0.0.0.0`) | Adresse d'écoute HTTP |
 | `CAMSTREAM_PORT` | `--port` | `8080` | Port HTTP (utilisé aussi par `camstream healthcheck`, avec `CAMSTREAM_BIND`) |
@@ -259,8 +262,8 @@ l'environnement. Les valeurs invalides provoquent un arrêt immédiat avec un me
 | `CAMSTREAM_HUB_CAPACITY` | `--hub-capacity` | `4` | Trames conservées dans le tampon de diffusion (arrondi à la puissance de deux supérieure ; 64 au plus) |
 | `CAMSTREAM_RECONNECT_INITIAL_MS` | `--reconnect-initial-ms` | `1000` | Première attente avant reconnexion de la webcam |
 | `CAMSTREAM_RECONNECT_MAX_MS` | `--reconnect-max-ms` | `30000` | Attente maximale entre deux tentatives (≥ attente initiale) |
-| `CAMSTREAM_SHUTDOWN_TIMEOUT_MS` | `--shutdown-timeout-ms` | `5000` | Délai maximal de l'arrêt gracieux |
-| `CAMSTREAM_HEALTHCHECK_TIMEOUT_MS` | `healthcheck --timeout-ms` | `2000` | Délai de la requête de la sous-commande `healthcheck` |
+| `CAMSTREAM_SHUTDOWN_TIMEOUT_MS` | `--shutdown-timeout-ms` | `5000` | Délai maximal de l'arrêt gracieux (doit dépasser le délai de lecture) |
+| `CAMSTREAM_HEALTHCHECK_TIMEOUT_MS` | `healthcheck --timeout-ms` | `2000` | Durée **totale** maximale de la sonde `healthcheck` (connexion, envoi, lecture) ; à garder sous le `--timeout` du `HEALTHCHECK` (3 s) |
 | `CAMSTREAM_JPEG_QUALITY` | — | — | **Non implémentée en v1** : qualité JPEG du repli YUYV, prévue en phase 2 |
 | `RUST_LOG` | — | `info` | Filtre `tracing` (ex. `camstream=debug`) |
 
@@ -312,10 +315,20 @@ Options (à valider, voir points ouverts) :
   client suivant.
 - `camstream healthcheck` : sous-commande qui interroge `/health` sur `CAMSTREAM_BIND:CAMSTREAM_PORT`
   (`127.0.0.1` si l'adresse d'écoute est `0.0.0.0`, `::1` si `::`) avec la bibliothèque standard
-  (pas de `curl` dans l'image), code de sortie 0 (HTTP 200) ou 1.
+  (pas de `curl` dans l'image), code de sortie 0 (HTTP 200) ou 1. Sa durée **totale** est
+  bornée par `CAMSTREAM_HEALTHCHECK_TIMEOUT_MS` (2 s) : elle conclut toujours avant le
+  `--timeout=3s` du `HEALTHCHECK`. Si ce dernier est réduit, réduire la variable d'autant
+  (par exemple `--timeout=2s` avec `CAMSTREAM_HEALTHCHECK_TIMEOUT_MS=1500`).
 - `docker stop` envoie `SIGTERM` : l'application arrête d'accepter des connexions, termine les
   flux en cours, arrête la capture et libère la webcam en moins de
-  `CAMSTREAM_SHUTDOWN_TIMEOUT_MS` ; `stop_grace_period` doit être supérieur.
+  `CAMSTREAM_SHUTDOWN_TIMEOUT_MS` ; `stop_grace_period` doit être supérieur. Le délai de
+  lecture (`CAMSTREAM_READ_TIMEOUT_MS`) doit être inférieur au délai d'arrêt (validé au
+  démarrage) : une lecture bloquée tient ainsi dans l'arrêt gracieux.
+- Webcam qui ne produit que des trames corrompues : rouverte après
+  `CAMSTREAM_MAX_CORRUPTED_FRAMES` trames consécutives (état `reconnecting`, erreur
+  `30 consecutive corrupted frames`). Défaillance interne de la bibliothèque V4L2 (donnée
+  inattendue du pilote) : état `reconnecting` avec `video driver library failed during …`,
+  sans redémarrage du conteneur.
 - Docker ne redémarre **pas** un conteneur seulement `unhealthy` (hors Swarm) : l'état de santé
   sert au diagnostic et à la supervision externe ; le redémarrage automatique repose sur la
   sortie du processus (erreur fatale ou panique du thread de capture → code 1 →
@@ -345,6 +358,11 @@ Règles de déploiement :
 - Durcissement du conteneur : utilisateur non root, `--cap-drop ALL`, `no-new-privileges`,
   système de fichiers en lecture seule (l'application n'écrit rien sur disque), uniquement des
   routes `GET`, limite de clients.
+- En-têtes HTTP de sécurité sur toutes les réponses : `X-Content-Type-Options: nosniff`,
+  `Content-Security-Policy` stricte (aucun script ni style en ligne, aucune ressource tierce,
+  `frame-ancestors 'none'`), `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`
+  ([architecture § 3.6](architecture.md#36-server--adaptateur-http)). Ils ne remplacent ni
+  l'authentification ni TLS.
 
 Évolution prévue (hors v1) : accès distant via un **reverse proxy** assurant TLS et
 authentification, ou via un **VPN** vers le réseau local. Camstream ne serait alors joignable

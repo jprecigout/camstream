@@ -8,7 +8,7 @@ pub mod cli;
 
 use std::ffi::OsString;
 use std::net::SocketAddr;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::time::Duration;
 
 use clap::Parser;
@@ -82,7 +82,7 @@ impl Command {
 pub struct HealthcheckConfig {
     /// Adresse d'écoute de l'instance à interroger (`CAMSTREAM_BIND`/`CAMSTREAM_PORT`).
     pub bind: SocketAddr,
-    /// Délai maximal de chaque étape de la requête.
+    /// Durée totale maximale de la sonde (connexion, envoi, lecture).
     pub timeout: Duration,
 }
 
@@ -108,6 +108,8 @@ pub struct AppConfig {
     pub idle_timeout: Duration,
     /// Délai maximal accordé à l'arrêt gracieux.
     pub shutdown_timeout: Duration,
+    /// Trames invalides consécutives tolérées avant de rouvrir la webcam.
+    pub max_corrupted_frames: NonZeroU32,
 }
 
 impl AppConfig {
@@ -129,6 +131,16 @@ impl AppConfig {
                 "--read-timeout-ms ({} ms) must exceed the frame interval at {fps} fps ({} ms)",
                 args.read_timeout_ms,
                 fps.frame_interval().as_millis()
+            )));
+        }
+        // À l'arrêt, le thread de capture n'observe le jeton qu'entre deux lectures :
+        // une lecture bloquée jusqu'au délai de lecture doit tenir dans le délai d'arrêt,
+        // sinon le join expire à chaque arrêt d'une webcam figée.
+        if args.read_timeout_ms >= args.shutdown_timeout_ms {
+            return Err(ConfigError::Invalid(format!(
+                "--read-timeout-ms ({} ms) must be shorter than --shutdown-timeout-ms ({} ms): \
+                 a blocked frame read must fit in the graceful shutdown",
+                args.read_timeout_ms, args.shutdown_timeout_ms
             )));
         }
         if args.hub_capacity.get() > MAX_HUB_CAPACITY {
@@ -162,6 +174,7 @@ impl AppConfig {
             reconnect_max: Duration::from_millis(args.reconnect_max_ms),
             idle_timeout: Duration::from_millis(args.idle_timeout_ms),
             shutdown_timeout: Duration::from_millis(args.shutdown_timeout_ms),
+            max_corrupted_frames: args.max_corrupted_frames,
         })
     }
 }
@@ -208,6 +221,7 @@ mod tests {
         assert_eq!(config.reconnect_initial, Duration::from_secs(1));
         assert_eq!(config.reconnect_max, Duration::from_secs(30));
         assert_eq!(config.shutdown_timeout, Duration::from_secs(5));
+        assert_eq!(config.max_corrupted_frames.get(), 30);
     }
 
     #[test]
@@ -262,6 +276,34 @@ mod tests {
                 "{args:?}"
             );
         }
+    }
+
+    #[test]
+    fn read_timeout_must_fit_in_the_shutdown_timeout() {
+        for args in [
+            &["--read-timeout-ms", "5000"][..],
+            &["--read-timeout-ms", "6000"],
+            &["--read-timeout-ms", "2000", "--shutdown-timeout-ms", "2000"],
+        ] {
+            match serve(args) {
+                Err(ConfigError::Invalid(message)) => {
+                    assert!(message.contains("--shutdown-timeout-ms"), "{message}");
+                }
+                other => panic!("{args:?}: unexpected {other:?}"),
+            }
+        }
+        let config = serve(&["--read-timeout-ms", "4999"]).unwrap();
+        assert_eq!(config.capture.read_timeout, Duration::from_millis(4999));
+    }
+
+    #[test]
+    fn corrupted_frame_threshold_is_configurable() {
+        let config = serve(&["--max-corrupted-frames", "5"]).unwrap();
+        assert_eq!(config.max_corrupted_frames.get(), 5);
+        assert!(matches!(
+            serve(&["--max-corrupted-frames", "0"]),
+            Err(ConfigError::Parse(_))
+        ));
     }
 
     #[test]

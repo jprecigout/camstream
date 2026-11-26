@@ -9,6 +9,7 @@ pub mod health;
 pub mod mjpeg;
 pub mod net;
 mod routes;
+pub mod security;
 
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicU64;

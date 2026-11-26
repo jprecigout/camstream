@@ -111,6 +111,12 @@ pub enum Step {
         /// Erreur finale.
         then: Failure,
     },
+    /// `create()` réussit ; la source alterne indéfiniment `corrupted_run` trames
+    /// corrompues puis une trame valide.
+    Intermittent {
+        /// Trames corrompues consécutives entre deux trames valides.
+        corrupted_run: u64,
+    },
 }
 
 impl Step {
@@ -126,6 +132,7 @@ impl Step {
 pub struct Probe {
     creates: Arc<AtomicUsize>,
     live: Arc<AtomicUsize>,
+    frames: Arc<AtomicUsize>,
 }
 
 impl Probe {
@@ -138,6 +145,11 @@ impl Probe {
     pub fn live(&self) -> usize {
         self.live.load(Ordering::SeqCst)
     }
+
+    /// Trames valides produites par toutes les sources.
+    pub fn frames(&self) -> usize {
+        self.frames.load(Ordering::SeqCst)
+    }
 }
 
 /// Fabrique scriptée : applique les étapes dans l'ordre, puis `Step::HEALTHY`.
@@ -147,20 +159,50 @@ impl Probe {
 pub struct ScriptedFactory {
     steps: Mutex<VecDeque<Step>>,
     interval: Duration,
+    frame_size: usize,
     probe: Probe,
 }
 
 impl ScriptedFactory {
-    /// Fabrique dont les sources produisent une trame toutes les `interval`.
+    /// Fabrique dont les sources produisent une trame minimale toutes les `interval`.
     pub fn new(steps: impl IntoIterator<Item = Step>, interval: Duration) -> (Box<Self>, Probe) {
+        Self::with_frame_size(steps, interval, TINY_JPEG.len())
+    }
+
+    /// Variante dont chaque trame pèse `frame_size` octets et porte son numéro de
+    /// séquence (lisible par [`frame_sequence`]) ; `frame_size` ≥ 12.
+    pub fn with_frame_size(
+        steps: impl IntoIterator<Item = Step>,
+        interval: Duration,
+        frame_size: usize,
+    ) -> (Box<Self>, Probe) {
         let probe = Probe::default();
         let factory = Box::new(Self {
             steps: Mutex::new(steps.into_iter().collect()),
             interval,
+            frame_size,
             probe: probe.clone(),
         });
         (factory, probe)
     }
+}
+
+/// Numéro de séquence porté par une trame d'une fabrique `with_frame_size`.
+pub fn frame_sequence(data: &[u8]) -> Option<u64> {
+    let bytes: [u8; 8] = data.get(2..10)?.try_into().ok()?;
+    Some(u64::from_le_bytes(bytes))
+}
+
+/// Construit une trame « JPEG structurel » de `size` octets portant `sequence`.
+fn numbered_frame(sequence: u64, size: usize) -> Bytes {
+    if size < 12 {
+        return Bytes::from_static(TINY_JPEG);
+    }
+    let mut data = vec![0_u8; size];
+    data[..2].copy_from_slice(&[0xFF, 0xD8]);
+    data[2..10].copy_from_slice(&sequence.to_le_bytes());
+    data[size - 2..].copy_from_slice(&[0xFF, 0xD9]);
+    Bytes::from(data)
 }
 
 impl FrameSourceFactory for ScriptedFactory {
@@ -172,19 +214,23 @@ impl FrameSourceFactory for ScriptedFactory {
             .unwrap()
             .pop_front()
             .unwrap_or(Step::HEALTHY);
-        match step {
-            Step::Fail(failure) => Err(failure.raise()),
-            Step::Source { frames, then } => {
-                self.probe.live.fetch_add(1, Ordering::SeqCst);
-                Ok(Box::new(ScriptedSource {
-                    remaining: frames,
-                    then,
-                    interval: self.interval,
-                    sequence: SequenceNumber::default(),
-                    live: Arc::clone(&self.probe.live),
-                }))
-            }
-        }
+        let (remaining, then, corrupted_run) = match step {
+            Step::Fail(failure) => return Err(failure.raise()),
+            Step::Source { frames, then } => (frames, then, None),
+            Step::Intermittent { corrupted_run } => (None, Failure::Corrupted, Some(corrupted_run)),
+        };
+        self.probe.live.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(ScriptedSource {
+            remaining,
+            then,
+            corrupted_run,
+            calls: 0,
+            interval: self.interval,
+            frame_size: self.frame_size,
+            sequence: SequenceNumber::default(),
+            live: Arc::clone(&self.probe.live),
+            frames: Arc::clone(&self.probe.frames),
+        }))
     }
 }
 
@@ -192,14 +238,24 @@ impl FrameSourceFactory for ScriptedFactory {
 pub struct ScriptedSource {
     remaining: Option<u64>,
     then: Failure,
+    corrupted_run: Option<u64>,
+    calls: u64,
     interval: Duration,
+    frame_size: usize,
     sequence: SequenceNumber,
     live: Arc<AtomicUsize>,
+    frames: Arc<AtomicUsize>,
 }
 
 impl FrameSource for ScriptedSource {
     fn next_frame(&mut self) -> Result<Frame, CaptureError> {
         std::thread::sleep(self.interval);
+        if let Some(run) = self.corrupted_run {
+            self.calls += 1;
+            if !self.calls.is_multiple_of(run + 1) {
+                return Err(Failure::Corrupted.raise());
+            }
+        }
         if let Some(remaining) = &mut self.remaining {
             if *remaining == 0 {
                 return Err(self.then.raise());
@@ -207,11 +263,12 @@ impl FrameSource for ScriptedSource {
             *remaining -= 1;
         }
         let frame = Frame::new(
-            Bytes::from_static(TINY_JPEG),
+            numbered_frame(self.sequence.get(), self.frame_size),
             Resolution::new(1, 1).unwrap(),
             self.sequence,
         );
         self.sequence = self.sequence.next();
+        self.frames.fetch_add(1, Ordering::SeqCst);
         Ok(frame)
     }
 
@@ -249,6 +306,7 @@ pub fn test_config() -> AppConfig {
         reconnect_max: Duration::from_millis(100),
         idle_timeout: Duration::from_millis(200),
         shutdown_timeout: Duration::from_secs(3),
+        max_corrupted_frames: 30.try_into().unwrap(),
     }
 }
 

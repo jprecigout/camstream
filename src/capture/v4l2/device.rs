@@ -10,6 +10,7 @@ use v4l::video::Capture;
 use v4l::{Format, FourCC, Fraction};
 
 use super::errno::{map_io_error, map_open_error};
+use super::guard::guarded;
 use super::release::Released;
 use super::source::V4l2Source;
 use crate::domain::{
@@ -61,15 +62,20 @@ impl V4l2Device<Opened> {
     ///
     /// Traduit `ENOENT`/`EACCES`/`EPERM`/`ENODEV` en [`CaptureError`] typées. Un nœud
     /// sans capture vidéo (nœud de métadonnées d'une webcam UVC, par exemple) donne
-    /// [`CaptureError::NotACaptureDevice`], fatale.
+    /// [`CaptureError::NotACaptureDevice`], fatale. Une panique de `v4l` (nom de carte
+    /// non UTF-8, chemin contenant un octet nul) donne [`CaptureError::DriverFault`].
     pub fn open(path: &DevicePath) -> Result<Self, CaptureError> {
-        let device = Device::with_path(path.as_path()).map_err(|e| map_open_error(path, e))?;
+        let device = guarded("open", || {
+            Device::with_path(path.as_path()).map_err(|e| map_open_error(path, e))
+        })?;
+        // Enveloppé avant `query_caps` : si celui-ci panique, le périphérique n'est pas
+        // détruit pendant le déroulement (pas de double panique), mais après, sous
+        // `catch_unwind`.
         let device = Released::new(device, "v4l device");
-        let caps = device
-            .get()
-            .ok_or(CaptureError::Disconnected)?
-            .query_caps()
-            .map_err(|e| map_io_error(path, e))?;
+        let opened = device.get().ok_or(CaptureError::Disconnected)?;
+        let caps = guarded("query_caps", || {
+            opened.query_caps().map_err(|e| map_io_error(path, e))
+        })?;
         // `v4l` renvoie les capacités du nœud (`device_caps`), pas celles de la carte.
         if !caps
             .capabilities
@@ -102,17 +108,22 @@ impl V4l2Device<Opened> {
             settings.resolution.height(),
             MJPEG,
         );
-        let format = device
-            .set_format(&wanted)
-            .map_err(|e| map_io_error(&self.path, e))?;
+        // `Format::from` panique (`expect`) sur un champ inconnu de la version de `v4l`.
+        let format = guarded("set_format", || {
+            device
+                .set_format(&wanted)
+                .map_err(|e| map_io_error(&self.path, e))
+        })?;
         if format.fourcc != MJPEG {
             tracing::error!(device = %self.path, negotiated = %fourcc_text(format.fourcc),
                 "the camera does not deliver MJPEG (required in v1)");
             return Err(CaptureError::UnsupportedFormat { preference });
         }
-        let params = device
-            .set_params(&Parameters::with_fps(settings.fps.get()))
-            .map_err(|e| map_io_error(&self.path, e))?;
+        let params = guarded("set_params", || {
+            device
+                .set_params(&Parameters::with_fps(settings.fps.get()))
+                .map_err(|e| map_io_error(&self.path, e))
+        })?;
 
         let resolution =
             Resolution::new(format.width, format.height).unwrap_or(settings.resolution);
@@ -140,8 +151,12 @@ impl V4l2Device<Configured> {
     /// démarrage de la webcam apparaît donc dans le premier `next_frame`.
     pub fn start_streaming(self, read_timeout: Duration) -> Result<V4l2Source, CaptureError> {
         let device = self.device.get().ok_or(CaptureError::Disconnected)?;
-        let mut stream = MmapStream::with_buffers(device, BufferType::VideoCapture, BUFFER_COUNT)
-            .map_err(|e| map_io_error(&self.path, e))?;
+        // Un échec en cours d'allocation détruit l'`Arena` partielle dans `v4l`, dont le
+        // `Drop` peut paniquer (`munmap`, `REQBUFS 0`) : appel protégé.
+        let mut stream = guarded("mmap_buffers", || {
+            MmapStream::with_buffers(device, BufferType::VideoCapture, BUFFER_COUNT)
+                .map_err(|e| map_io_error(&self.path, e))
+        })?;
         stream.set_timeout(read_timeout.min(MAX_POLL_TIMEOUT));
         let negotiated = self.state.negotiated;
         let description = SourceDescription {
