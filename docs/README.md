@@ -4,9 +4,19 @@ Toute la documentation du projet est rédigée en français et les diagrammes so
 
 | Document | Contenu |
 |---|---|
-| [architecture.md](architecture.md) | Vue d'ensemble, composants, flux de données |
-| [design-patterns.md](design-patterns.md) | Catalogue des design patterns utilisés |
-| [deploiement.md](deploiement.md) | Docker, Raspberry Pi, accès à la webcam |
+| [architecture.md](architecture.md) | Vue d'ensemble, modules, ports et adaptateurs, flux de données, erreurs, concurrence, cycle de vie |
+| [design-patterns.md](design-patterns.md) | Catalogue des design patterns utilisés (et écartés) |
+| [deploiement.md](deploiement.md) | Docker, Raspberry Pi, accès à la webcam, variables d'environnement |
 | [adr/](adr/) | Décisions d'architecture (ADR) |
+
+## Décisions d'architecture (ADR)
+
+| N° | Titre | Statut |
+|---|---|---|
+| [0001](adr/0001-architecture-hexagonale-et-decoupage-en-modules.md) | Architecture hexagonale et découpage en modules | Proposé |
+| [0002](adr/0002-transport-mjpeg-multipart.md) | Transport vidéo : MJPEG en `multipart/x-mixed-replace` | Proposé |
+| [0003](adr/0003-choix-des-crates.md) | Choix des crates (runtime, HTTP, V4L2, erreurs, configuration, logs) | Proposé |
+| [0004](adr/0004-distribution-des-trames-et-concurrence.md) | Distribution des trames et modèle de concurrence | Proposé |
+| [0005](adr/0005-image-docker-et-compilation-arm64.md) | Image Docker et compilation pour arm64 | Proposé |
 
 Les règles du projet sont décrites dans [`CLAUDE.md`](../CLAUDE.md).
