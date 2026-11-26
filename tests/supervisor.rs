@@ -41,7 +41,11 @@ impl Harness {
         before_spawn: impl FnOnce(&FrameHub),
     ) -> Self {
         let (factory, probe) = ScriptedFactory::new(steps, FRAME_INTERVAL);
-        let hub = FrameHub::new(HubCapacity::DEFAULT);
+        // Tampon large (64 trames, soit 320 ms à 5 ms par trame) : un test ralenti par
+        // une machine chargée ne doit pas sauter de trames (`Lagged`), sinon les
+        // assertions sur les numéros de séquence deviendraient aléatoires. Les sauts
+        // de trames sont testés à part (`stream::hub`, `tests/slow_client.rs`).
+        let hub = FrameHub::new(HubCapacity::new(64).expect("non-zero capacity"));
         let cancel = CancellationToken::new();
         let supervisor = CaptureSupervisor::new(
             factory,
@@ -93,6 +97,7 @@ fn settings(idle_timeout: Duration, backoff_initial: Duration) -> SupervisorSett
     SupervisorSettings {
         backoff: BackoffPolicy::new(backoff_initial, backoff_initial * 4),
         idle_timeout,
+        ..SupervisorSettings::default()
     }
 }
 
@@ -320,17 +325,46 @@ async fn missing_camera_at_startup_is_retried_only_with_viewers() {
     harness.stop().await;
 }
 
+fn corruption_settings(max_corrupted_frames: u32, backoff: Duration) -> SupervisorSettings {
+    SupervisorSettings {
+        max_corrupted_frames: max_corrupted_frames.try_into().unwrap(),
+        ..settings(Duration::from_secs(5), backoff)
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn corrupted_frames_are_skipped_without_reopening() {
+async fn isolated_corrupted_frames_are_skipped_and_the_counter_resets() {
+    // 4 trames corrompues puis 1 valide, en boucle, avec un seuil de 5 : le compteur
+    // repart de zéro à chaque trame valide, la source n'est jamais rouverte.
+    let mut harness = Harness::start(
+        [Step::HEALTHY, Step::Intermittent { corrupted_run: 4 }],
+        corruption_settings(5, Duration::from_millis(20)),
+    );
+    harness.wait("Idle", |s| *s == SourceStatus::Idle).await;
+    let mut subscriber = harness.hub.subscribe();
+    for _ in 0..6 {
+        within("valid frame", subscriber.next_frame())
+            .await
+            .expect("frame");
+    }
+    assert_eq!(harness.probe.creates(), 2, "never reopened");
+    assert!(is_streaming(&harness.status.borrow()));
+    drop(subscriber);
+    harness.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stream_of_corrupted_frames_is_reopened() {
     let mut harness = Harness::start(
         [
-            Step::HEALTHY,
+            Step::HEALTHY, // sonde
             Step::Source {
                 frames: Some(2),
                 then: Failure::Corrupted,
             },
         ],
-        settings(Duration::from_millis(50), Duration::from_millis(20)),
+        // Attente de 300 ms : laisse le temps d'observer `Reconnecting`.
+        corruption_settings(5, Duration::from_millis(300)),
     );
     harness.wait("Idle", |s| *s == SourceStatus::Idle).await;
     let mut subscriber = harness.hub.subscribe();
@@ -339,10 +373,31 @@ async fn corrupted_frames_are_skipped_without_reopening() {
             .await
             .expect("frame");
     }
-    // La source ne produit plus que des trames corrompues : aucune réouverture.
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    assert_eq!(harness.probe.creates(), 2);
-    assert!(is_streaming(&harness.status.borrow()));
+    let status = harness
+        .wait("Reconnecting", |s| {
+            matches!(s, SourceStatus::Reconnecting { .. })
+        })
+        .await;
+    assert_eq!(
+        status,
+        SourceStatus::Reconnecting {
+            attempt: 1,
+            last_error: "5 consecutive corrupted frames".into()
+        }
+    );
+    // Nouvelle source saine : la même souscription reçoit de nouveau des trames.
+    let frame = within("frame after reopening", subscriber.next_frame())
+        .await
+        .expect("frame");
+    // Trame de la nouvelle source : son numéro repart de 0, décalé seulement des
+    // trames sautées si le test a été ralenti (aucune avant : 2 trames publiées, 2 lues).
+    assert_eq!(
+        frame.sequence().get(),
+        subscriber.skipped_frames(),
+        "frame of the new source"
+    );
+    assert_eq!(harness.probe.creates(), 3);
+    assert_eq!(harness.probe.live(), 1, "corrupted source released");
     drop(subscriber);
     harness.stop().await;
 }

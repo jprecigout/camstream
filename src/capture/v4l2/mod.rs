@@ -3,10 +3,12 @@
 //! Seul module du projet qui touche au matériel. Enseignements du spike 0001
 //! appliqués : troncature à `bytesused`, délai de `poll` borné, `Timeout` classé
 //! `Reopen` (`EINVAL` après `TimedOut`), `Drop` de `v4l` sous `catch_unwind`,
-//! classification des `errno`.
+//! classification des `errno`. Les paniques de `v4l` hors `Drop` (ouverture,
+//! configuration, allocation, lecture) sont aussi interceptées (`guard`).
 
 mod device;
 mod errno;
+mod guard;
 mod release;
 mod source;
 

@@ -14,6 +14,7 @@
 | [Adapter](#adapter) | Structure | Isoler la crate `v4l` et axum derrière nos propres types | `src/capture/v4l2/` — `V4l2Device`, `V4l2Source` ; `src/server/` |
 | [Factory](#factory) | Création | Recréer une source après déconnexion sans connaître son type | `src/domain/source.rs` — `FrameSourceFactory` ; `src/capture/factory.rs` — `SourceFactory` ; `ScriptedFactory` (tests) |
 | [Builder](#builder) | Création | Construire le serveur avec paramètres obligatoires et optionnels | `src/server/mod.rs` — `ServerBuilder` |
+| [Decorator](#decorator) | Structure | Ajouter les en-têtes de sécurité à **toutes** les réponses sans modifier chaque handler | `src/server/security.rs` — `add_security_headers` ; appliqué dans `src/server/routes.rs` (`map_response`) |
 | [DTO](#dto-data-transfer-object) | Structure | Contrat JSON de `/health` indépendant des types du cœur | `src/server/health.rs` — `HealthReport`, `CameraReport`, `SourceReport` |
 | [Newtype](#newtype) | Idiome Rust | Interdire les valeurs invalides ou confondues | `src/domain/frame.rs`, `src/domain/device.rs`, `src/stream/hub.rs`, `src/server/mjpeg.rs` |
 | [RAII](#raii) | Idiome Rust | Libérer périphérique, tampons, abonnements, demande et places client sans oubli ; signaler une panique | `V4l2Source`, `Released<T>`, `FrameSubscriber`, `ClientSession`, `OwnedSemaphorePermit`, `PanicGuard` |
@@ -125,6 +126,10 @@ classDiagram
   - côté entrant : `src/server/` adapte le `FrameHub` au protocole HTTP multipart
     (`src/server/mjpeg.rs`, fonction `stream` et `ClientSession`).
 - **Traduction des erreurs** : `src/capture/v4l2/errno.rs` (`map_open_error`, `map_io_error`).
+- **Traduction des paniques** : l'adaptateur ne laisse aucune panique de `v4l` atteindre le
+  cœur. Les appels passent par `guarded()` (`src/capture/v4l2/guard.rs`), qui convertit une
+  panique en `CaptureError::DriverFault` (`Reopen`) ; les destructions passent par
+  `Released<T>` (voir [RAII](#raii)). Voir [architecture § 7.2](architecture.md#72-robustesse-après-la-revue-de-la-v1).
 
 ```mermaid
 classDiagram
@@ -218,6 +223,35 @@ classDiagram
         +run() Result
     }
     ServerBuilder ..> Server : build()
+```
+
+## Decorator
+
+- **Catégorie** : structure.
+- **Problème résolu** : les en-têtes de sécurité (`X-Content-Type-Options`, CSP,
+  `X-Frame-Options`, `Referrer-Policy`, ADR 0007) doivent figurer sur **toutes** les réponses,
+  y compris les `404`/`405` produites par axum et le `503` du limiteur de clients. Les ajouter
+  dans chaque handler serait fragile (un oubli suffit) et mêlerait sécurité et logique métier.
+- **Où** : `add_security_headers` (`src/server/security.rs`), posé par
+  `Router::layer(map_response(...))` dans `src/server/routes.rs`. Le décorateur enveloppe le
+  routeur entier : il reçoit chaque réponse, ajoute les en-têtes **sans écraser** ceux déjà
+  définis par un handler, et la renvoie inchangée par ailleurs (corps MJPEG compris, qui
+  reste un flux).
+- **Portée** : distinct du Decorator écarté plus bas, qui concerne uniquement l'encodage
+  YUYV → JPEG des trames.
+
+```mermaid
+sequenceDiagram
+    participant C as Navigateur
+    participant D as add_security_headers (Decorator)
+    participant R as Routeur axum
+    participant H as Handler (/, /stream.mjpg, /health, 404…)
+    C->>D: requête HTTP
+    D->>R: transmet
+    R->>H: route
+    H-->>R: réponse
+    R-->>D: réponse (statut, en-têtes, corps)
+    D-->>C: même réponse + nosniff, CSP, X-Frame-Options, Referrer-Policy
 ```
 
 ## DTO (Data Transfer Object)

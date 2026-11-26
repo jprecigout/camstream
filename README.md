@@ -14,7 +14,8 @@ Conçu pour un **Raspberry Pi** (Raspberry Pi OS 64 bits, `aarch64`) dans **Dock
 - **Mire de test** intégrée pour essayer sans webcam (`--source synthetic`).
 - Endpoint de santé `/health` et sous-commande `camstream healthcheck` pour Docker.
 
-> **Sécurité** : la v1 n'a **ni authentification ni TLS**. Elle est réservée au **réseau
+> **Sécurité** : la v1 n'a **ni authentification ni TLS** (seuls des en-têtes HTTP de
+> durcissement sont envoyés : `nosniff`, CSP stricte, `X-Frame-Options`, `Referrer-Policy`). Elle est réservée au **réseau
 > local** : ne jamais l'exposer sur Internet (voir [ADR 0007](docs/adr/0007-securite-reseau-local-v1.md)
 > et [déploiement § 9](docs/deploiement.md#9-sécurité)).
 
@@ -72,7 +73,7 @@ Un [`docker-compose.yml`](docker-compose.yml) d'exemple est fourni.
 
 | Route | Rôle |
 |---|---|
-| `GET /` | Page HTML affichant le flux (« Démarrage de la caméra… » jusqu'à la première image) |
+| `GET /` | Page HTML affichant le flux (« Démarrage de la caméra… » jusqu'à la première image) ; script et style servis par `GET /camstream.js` et `GET /camstream.css` |
 | `GET /stream.mjpg` | Flux MJPEG `multipart/x-mixed-replace` ; `503` au-delà de la limite de clients |
 | `GET /health` | État JSON, ex. `{"status":"ok","camera":{"state":"idle"},"clients":0}` ; `503` si la capture a échoué |
 
@@ -89,6 +90,8 @@ Toutes les options existent en ligne de commande et en variable d'environnement
 | `CAMSTREAM_BIND` / `CAMSTREAM_PORT` | `127.0.0.1` / `8080` | Écoute HTTP (`0.0.0.0` dans l'image Docker) |
 | `CAMSTREAM_IDLE_TIMEOUT_MS` | `10000` | Délai avant d'éteindre la webcam sans spectateur |
 | `CAMSTREAM_MAX_CLIENTS` | `10` | Spectateurs simultanés maximum |
+| `CAMSTREAM_READ_TIMEOUT_MS` / `CAMSTREAM_SHUTDOWN_TIMEOUT_MS` | `2000` / `5000` | Attente d'une trame / durée de l'arrêt gracieux (le premier doit rester inférieur au second) |
+| `CAMSTREAM_MAX_CORRUPTED_FRAMES` | `30` | Trames corrompues consécutives tolérées avant de rouvrir la webcam |
 
 Liste complète : [deploiement.md § 5](docs/deploiement.md#5-variables-denvironnement).
 Codes de sortie : `0` arrêt normal, `1` échec (capture, serveur, healthcheck), `2` configuration

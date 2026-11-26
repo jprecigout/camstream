@@ -63,7 +63,9 @@ ENV CAMSTREAM_BIND=0.0.0.0 \
 EXPOSE 8080
 STOPSIGNAL SIGTERM
 
-# Sonde sans curl : le binaire interroge lui-même /health sur 127.0.0.1.
+# Sonde sans curl : le binaire interroge lui-même /health sur 127.0.0.1. Sa durée
+# totale est bornée par CAMSTREAM_HEALTHCHECK_TIMEOUT_MS (2 s par défaut), inférieure
+# au --timeout de 3 s : la sonde conclut toujours (code 0 ou 1) avant que Docker la tue.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
     CMD ["/usr/local/bin/camstream", "healthcheck"]
 

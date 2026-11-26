@@ -5,7 +5,7 @@
 //! `docs/deploiement.md` § 5 et doivent rester synchronisées avec ce fichier.
 
 use std::net::IpAddr;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -38,10 +38,12 @@ pub enum CliCommand {
     /// 1 sinon (sonde `HEALTHCHECK` de Docker).
     #[command(about = "Query /health on the local instance (exit code 0 if healthy, 1 otherwise)")]
     Healthcheck {
-        /// Délai maximal de chaque étape de la requête, en millisecondes.
+        /// Durée totale maximale de la sonde (connexion, envoi, lecture), en
+        /// millisecondes ; doit rester inférieure au `--timeout` du `HEALTHCHECK` Docker.
         #[arg(long, env = "CAMSTREAM_HEALTHCHECK_TIMEOUT_MS", default_value_t = 2000,
               value_parser = clap::value_parser!(u64).range(1..),
-              help = "Request timeout in milliseconds")]
+              help = "Total timeout of the health check in milliseconds \
+                      (keep it below the Docker HEALTHCHECK --timeout)")]
         timeout_ms: u64,
     },
 }
@@ -104,8 +106,17 @@ pub struct ServeArgs {
     /// Attente maximale d'une trame avant de considérer la webcam figée (rouverte).
     #[arg(long, env = "CAMSTREAM_READ_TIMEOUT_MS", default_value_t = 2000,
           value_parser = clap::value_parser!(u64).range(1..),
-          help = "Maximum wait for a frame (ms) before the camera is reopened")]
+          help = "Maximum wait for a frame (ms) before the camera is reopened \
+                  (must be shorter than the shutdown timeout)")]
     pub read_timeout_ms: u64,
+    /// Trames invalides consécutives tolérées avant de rouvrir la webcam.
+    #[arg(
+        long,
+        env = "CAMSTREAM_MAX_CORRUPTED_FRAMES",
+        default_value = "30",
+        help = "Consecutive corrupted frames tolerated before the camera is reopened"
+    )]
+    pub max_corrupted_frames: NonZeroU32,
     /// Délai de grâce avant d'éteindre la webcam sans spectateur (0 : immédiat).
     #[arg(
         long,

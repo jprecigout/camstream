@@ -6,6 +6,7 @@ use v4l::io::traits::CaptureStream;
 use v4l::prelude::{Device, MmapStream};
 
 use super::errno::map_io_error;
+use super::guard::guarded;
 use super::release::Released;
 use crate::capture::jpeg::complete_jpeg_len;
 use crate::domain::{
@@ -54,21 +55,23 @@ impl FrameSource for V4l2Source {
     /// au pilote à la lecture suivante.
     fn next_frame(&mut self) -> Result<Frame, CaptureError> {
         let stream = self.stream.get_mut().ok_or(CaptureError::Disconnected)?;
-        let (buffer, meta) =
-            CaptureStream::next(stream).map_err(|e| map_io_error(&self.path, e))?;
-        if meta.flags.contains(BufferFlags::ERROR) {
-            return Err(CaptureError::CorruptedFrame);
-        }
-        let used = usize::try_from(meta.bytesused)
-            .unwrap_or(usize::MAX)
-            .min(buffer.len());
-        let payload = &buffer[..used];
-        let len = complete_jpeg_len(payload).ok_or(CaptureError::CorruptedFrame)?;
-        let frame = Frame::new(
-            Bytes::copy_from_slice(&payload[..len]),
-            self.description.resolution,
-            self.sequence,
-        );
+        let path = &self.path;
+        // `v4l` indexe ses métadonnées par l'index de tampon renvoyé par le pilote :
+        // une valeur inattendue paniquerait. La copie a lieu dans l'appel protégé, car
+        // le tampon emprunté ne peut pas en sortir.
+        let data = guarded("dequeue", || {
+            let (buffer, meta) = CaptureStream::next(stream).map_err(|e| map_io_error(path, e))?;
+            if meta.flags.contains(BufferFlags::ERROR) {
+                return Err(CaptureError::CorruptedFrame);
+            }
+            let used = usize::try_from(meta.bytesused)
+                .unwrap_or(usize::MAX)
+                .min(buffer.len());
+            let payload = &buffer[..used];
+            let len = complete_jpeg_len(payload).ok_or(CaptureError::CorruptedFrame)?;
+            Ok(Bytes::copy_from_slice(&payload[..len]))
+        })?;
+        let frame = Frame::new(data, self.description.resolution, self.sequence);
         self.sequence = self.sequence.next();
         Ok(frame)
     }

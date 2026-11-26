@@ -68,6 +68,24 @@ pub enum CaptureError {
     /// Trame invalide (JPEG tronqué, tampon vide) : on la jette.
     #[error("corrupted frame")]
     CorruptedFrame,
+    /// Trop de trames invalides consécutives : la source est considérée défaillante.
+    ///
+    /// Produite par le superviseur (et non par un adaptateur) quand
+    /// `CorruptedFrame` se répète sans aucune trame valide entre deux.
+    #[error("{consecutive} consecutive corrupted frames")]
+    CorruptedStream {
+        /// Nombre de trames invalides consécutives ayant déclenché l'erreur.
+        consecutive: u32,
+    },
+    /// Défaillance interne de la bibliothèque d'accès au pilote (panique interceptée
+    /// dans l'adaptateur, par exemple sur une donnée inattendue renvoyée par le pilote).
+    #[error("video driver library failed during {operation}: {message}")]
+    DriverFault {
+        /// Opération en cours (ex. « query_caps »).
+        operation: &'static str,
+        /// Message de la panique interceptée.
+        message: String,
+    },
     /// Autre erreur d'entrée/sortie du pilote.
     #[error("video I/O error")]
     Io(#[source] std::io::Error),
@@ -90,12 +108,21 @@ impl CaptureError {
     /// `Timeout` mène à `Reopen` : avec `v4l` 0.14, un flux qui a expiré n'est plus
     /// réutilisable (`EINVAL` au `QBUF` suivant), et une webcam muette pendant le
     /// délai de lecture est considérée comme figée.
+    ///
+    /// `DriverFault` mène aussi à `Reopen`, même si la cause peut être permanente
+    /// (nom de carte invalide) : la reprise n'a lieu qu'en présence de spectateurs,
+    /// avec attente exponentielle plafonnée, et l'erreur reste visible dans
+    /// `/health` ; `Fatal` provoquerait au contraire une boucle de redémarrage du
+    /// conteneur sans rien réparer (architecture § 7.2).
     pub fn recovery(&self) -> Recovery {
         match self {
             Self::CorruptedFrame => Recovery::Skip,
-            Self::DeviceNotFound(_) | Self::Disconnected | Self::Timeout | Self::Io(_) => {
-                Recovery::Reopen
-            }
+            Self::DeviceNotFound(_)
+            | Self::Disconnected
+            | Self::Timeout
+            | Self::Io(_)
+            | Self::CorruptedStream { .. }
+            | Self::DriverFault { .. } => Recovery::Reopen,
             Self::PermissionDenied(_)
             | Self::NotACaptureDevice(_)
             | Self::UnsupportedFormat { .. }
@@ -143,6 +170,17 @@ mod tests {
         let cases = [
             (CaptureError::CorruptedFrame, Recovery::Skip),
             (CaptureError::Timeout, Recovery::Reopen),
+            (
+                CaptureError::CorruptedStream { consecutive: 30 },
+                Recovery::Reopen,
+            ),
+            (
+                CaptureError::DriverFault {
+                    operation: "query_caps",
+                    message: "boom".into(),
+                },
+                Recovery::Reopen,
+            ),
             (CaptureError::Disconnected, Recovery::Reopen),
             (CaptureError::DeviceNotFound(path()), Recovery::Reopen),
             (
