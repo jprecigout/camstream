@@ -60,4 +60,8 @@ Distroless pourra remplacer `bookworm-slim` une fois le déploiement stabilisé 
 - Le GID du groupe `video` doit correspondre entre l'hôte et le conteneur (44 sous Debian et
   Raspberry Pi OS) ; à défaut, utiliser `group_add` avec le GID numérique de `/dev/video0`.
 - Le spike de cross-compilation de `v4l` (ADR 0003) conditionne la validation définitive de
-  cet ADR.
+  cet ADR. **Avancement (2026-11-26)** : cross-compilation **validée** avec les mêmes paquets et
+  variables que le Dockerfile prévu, mais **hors Docker** (registre Docker Hub inaccessible
+  depuis l'environnement du spike) ; le binaire ne requiert pas plus que `GLIBC_2.34`,
+  compatible avec Bookworm. Le build `docker buildx` lui-même reste à exécuter
+  ([spike 0001](../spikes/0001-v4l.md)). Statut inchangé : « Proposé ».
