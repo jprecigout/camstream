@@ -6,6 +6,15 @@
       <stop offset="0.55" stop-color="#F72585"/>
       <stop offset="1" stop-color="#FF8C42"/>
     </linearGradient>
+    <radialGradient id="iris" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0.35" stop-color="#FFB86B"/>
+      <stop offset="0.65" stop-color="#F72585"/>
+      <stop offset="1" stop-color="#7B2FF7"/>
+    </radialGradient>
+    <radialGradient id="halo" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0.7" stop-color="#F72585" stop-opacity="0.45"/>
+      <stop offset="1" stop-color="#F72585" stop-opacity="0"/>
+    </radialGradient>
     <radialGradient id="glow" cx="0.3" cy="0.25" r="0.9">
       <stop offset="0" stop-color="#23163F"/>
       <stop offset="1" stop-color="#0B0B1A"/>
@@ -14,8 +23,16 @@
   <rect width="512" height="512" rx="120" fill="url(#glow)"/>
     <!-- Objectif : anneau ouvert vers la droite, d'où sort le flux -->
     <path d="M329.6 339.6 A130 130 0 1 1 329.6 172.4" fill="none" stroke="url(#grad)" stroke-width="44" stroke-linecap="round"/>
-    <circle cx="230" cy="256" r="50" fill="url(#grad)"/>
-    <circle cx="214" cy="240" r="13" fill="#FFFFFF" opacity="0.9"/>
+    <!-- Lentille : halo, monture, iris lumineux, pupille et reflets -->
+    <circle cx="230" cy="256" r="104" fill="url(#halo)"/>
+    <circle cx="230" cy="256" r="88" fill="#100A22"/>
+    <circle cx="230" cy="256" r="88" fill="none" stroke="#FFFFFF" stroke-opacity="0.14" stroke-width="3"/>
+    <circle cx="230" cy="256" r="68" fill="url(#iris)"/>
+    <circle cx="230" cy="256" r="68" fill="none" stroke="#FFFFFF" stroke-opacity="0.25" stroke-width="2"/>
+    <circle cx="230" cy="256" r="30" fill="#0B0B1A"/>
+    <path d="M178 238 A56 56 0 0 1 222 196" fill="none" stroke="#FFFFFF" stroke-width="9" stroke-linecap="round" opacity="0.85"/>
+    <circle cx="216" cy="242" r="10" fill="#FFFFFF"/>
+    <circle cx="262" cy="288" r="5" fill="#FFFFFF" opacity="0.55"/>
     <!-- Flux : trois traits de vitesse -->
     <g stroke="url(#grad)" stroke-width="26" stroke-linecap="round">
       <line x1="356" y1="210" x2="396" y2="210" opacity="0.6"/>
