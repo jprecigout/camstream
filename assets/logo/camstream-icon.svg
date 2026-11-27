@@ -1,26 +1,25 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-labelledby="title">
   <title id="title">Camstream</title>
   <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#6366F1"/>
-      <stop offset="1" stop-color="#06B6D4"/>
+    <linearGradient id="grad" gradientUnits="userSpaceOnUse" x1="100" y1="400" x2="440" y2="110">
+      <stop offset="0" stop-color="#7B2FF7"/>
+      <stop offset="0.55" stop-color="#F72585"/>
+      <stop offset="1" stop-color="#FF8C42"/>
     </linearGradient>
-    <radialGradient id="iris" cx="0.35" cy="0.35" r="0.75">
-      <stop offset="0" stop-color="#22D3EE"/>
-      <stop offset="1" stop-color="#4F46E5"/>
+    <radialGradient id="glow" cx="0.3" cy="0.25" r="0.9">
+      <stop offset="0" stop-color="#23163F"/>
+      <stop offset="1" stop-color="#0B0B1A"/>
     </radialGradient>
   </defs>
-  <rect width="512" height="512" rx="116" fill="url(#bg)"/>
-  <!-- Objectif -->
-  <circle cx="214" cy="256" r="122" fill="#FFFFFF"/>
-  <circle cx="214" cy="256" r="84" fill="#0F172A"/>
-  <circle cx="214" cy="256" r="48" fill="url(#iris)"/>
-  <circle cx="194" cy="234" r="14" fill="#FFFFFF" opacity="0.9"/>
-  <!-- Ondes de diffusion -->
-  <g fill="none" stroke="#FFFFFF" stroke-linecap="round" stroke-width="26">
-    <path d="M353.3 158.5 A170 170 0 0 1 353.3 353.5"/>
-    <path d="M390.1 132.7 A215 215 0 0 1 390.1 379.3" opacity="0.55"/>
-  </g>
-  <!-- Témoin « en direct » -->
-  <circle cx="420" cy="92" r="20" fill="#F43F5E" stroke="#FFFFFF" stroke-width="6"/>
+  <rect width="512" height="512" rx="120" fill="url(#glow)"/>
+    <!-- Objectif : anneau ouvert vers la droite, d'où sort le flux -->
+    <path d="M329.6 339.6 A130 130 0 1 1 329.6 172.4" fill="none" stroke="url(#grad)" stroke-width="44" stroke-linecap="round"/>
+    <circle cx="230" cy="256" r="50" fill="url(#grad)"/>
+    <circle cx="214" cy="240" r="13" fill="#FFFFFF" opacity="0.9"/>
+    <!-- Flux : trois traits de vitesse -->
+    <g stroke="url(#grad)" stroke-width="26" stroke-linecap="round">
+      <line x1="356" y1="210" x2="396" y2="210" opacity="0.6"/>
+      <line x1="356" y1="256" x2="436" y2="256"/>
+      <line x1="356" y1="302" x2="396" y2="302" opacity="0.6"/>
+    </g>
 </svg>
