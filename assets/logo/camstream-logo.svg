@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 552 160" width="552" height="160" role="img" aria-labelledby="title">
+  <title id="title">Camstream</title>
+  <style>
+    .word { fill: #0F172A; }
+    @media (prefers-color-scheme: dark) { .word { fill: #F1F5F9; } }
+  </style>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#6366F1"/>
+      <stop offset="1" stop-color="#06B6D4"/>
+    </linearGradient>
+    <linearGradient id="txt" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#6366F1"/>
+      <stop offset="1" stop-color="#06B6D4"/>
+    </linearGradient>
+    <radialGradient id="iris" cx="0.35" cy="0.35" r="0.75">
+      <stop offset="0" stop-color="#22D3EE"/>
+      <stop offset="1" stop-color="#4F46E5"/>
+    </radialGradient>
+  </defs>
+  <g transform="translate(16 16) scale(0.25)">
+    <rect width="512" height="512" rx="116" fill="url(#bg)"/>
+    <circle cx="214" cy="256" r="122" fill="#FFFFFF"/>
+    <circle cx="214" cy="256" r="84" fill="#0F172A"/>
+    <circle cx="214" cy="256" r="48" fill="url(#iris)"/>
+    <circle cx="194" cy="234" r="14" fill="#FFFFFF" opacity="0.9"/>
+    <g fill="none" stroke="#FFFFFF" stroke-linecap="round" stroke-width="26">
+      <path d="M353.3 158.5 A170 170 0 0 1 353.3 353.5"/>
+      <path d="M390.1 132.7 A215 215 0 0 1 390.1 379.3" opacity="0.55"/>
+    </g>
+    <circle cx="420" cy="92" r="20" fill="#F43F5E" stroke="#FFFFFF" stroke-width="6"/>
+  </g>
+  <text x="172" y="104" font-family="Inter, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="68" font-weight="800" letter-spacing="-2">
+    <tspan class="word">cam</tspan><tspan fill="url(#txt)">stream</tspan>
+  </text>
+</svg>
