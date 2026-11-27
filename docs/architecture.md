@@ -73,7 +73,8 @@ src/
 │       └── release.rs   # Released<T> : Drop de v4l sous catch_unwind (RAII)
 ├── server/              # ADAPTATEUR HTTP (axum)
 │   ├── mod.rs           # ServerBuilder, Server, BoundServer, ServerError
-│   ├── routes.rs        # routeur : /, /camstream.js, /camstream.css, /stream.mjpg, /health
+│   ├── routes.rs        # routeur : /, /camstream.js, /camstream.css, /favicon.svg,
+│   │                    # /logo.svg, /stream.mjpg, /health
 │   │                    # ServerState (privé) ; couche d'en-têtes de sécurité
 │   ├── security.rs      # add_security_headers (nosniff, CSP, X-Frame-Options, Referrer-Policy)
 │   ├── mjpeg.rs         # corps multipart en streaming, MaxClients, ClientLimiter (Semaphore, RAII)
@@ -81,7 +82,7 @@ src/
 │   ├── net.rs           # TcpOptions, apply_tcp_options (keepalive, TCP_USER_TIMEOUT, NODELAY)
 │   ├── index.html       # page minimale (include_str!), sans code en ligne (CSP)
 │   ├── camstream.js     # script de la page (masque l'attente, relance le flux)
-│   └── camstream.css    # style de la page
+│   └── camstream.css    # style de la page (charte du logo)
 └── config/              # lecture et validation de la configuration
     ├── mod.rs           # Command (Serve / Healthcheck), AppConfig, HealthcheckConfig, ConfigError
     └── cli.rs           # Cli (clap derive + env), enums miroirs SourceArg / FormatArg
@@ -1039,6 +1040,8 @@ Routes :
 | `GET /` | Page HTML minimale (`<img src="/stream.mjpg">`, texte « Démarrage de la caméra… » jusqu'à la première image), **sans script ni style en ligne** (CSP) |
 | `GET /camstream.js` | Script de la page (`text/javascript`) : masque l'attente, relance le flux si la connexion tombe |
 | `GET /camstream.css` | Style de la page (`text/css`) |
+| `GET /favicon.svg` | Icône de l'onglet (`image/svg+xml`, `Cache-Control: no-cache`), embarquée depuis `assets/logo/camstream-icon.svg` |
+| `GET /logo.svg` | Logo en tête de page (`image/svg+xml`, `no-cache`), embarqué depuis `assets/logo/camstream-logo-dark.svg` (sans `<style>` interne, bloqué par la CSP) |
 | `GET /stream.mjpg` | `200`, `multipart/x-mixed-replace; boundary=frame`, `Cache-Control: no-cache, no-store, must-revalidate`, corps infini ; `503` (avec `Retry-After: 5`) si `MaxClients` atteint |
 | `GET /health` | JSON `HealthReport`, ex. `{"status":"ok","camera":{"state":"idle"},"clients":0}` ; `200` dans tous les états sauf `failed` → `503` |
 | autre | `404` ; méthode autre que `GET`/`HEAD` sur une route connue : `405` |

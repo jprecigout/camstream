@@ -144,6 +144,9 @@ Remarques :
 - `--locked` impose le `Cargo.lock` versionné ;
 - la mire synthétique (`assets/synthetic/*.jpg`) est embarquée dans le binaire : l'image
   peut valider un déploiement sans webcam (`CAMSTREAM_SOURCE=synthetic`) ;
+- l'icône et le logo de la page (`assets/logo/camstream-icon.svg`,
+  `assets/logo/camstream-logo-dark.svg`) sont aussi embarqués : `assets/` ne doit pas être
+  ajouté au `.dockerignore` ;
 - le [`.dockerignore`](../.dockerignore) exclut `target/`, `.git/`, `docs/`, `spikes/`…
 
 Commandes :
