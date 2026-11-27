@@ -1,3 +1,5 @@
+<p align="center"><img src="../assets/logo/camstream-icon.svg" alt="Camstream" width="96"></p>
+
 # Documentation Camstream
 
 Toute la documentation du projet est rédigée en français et les diagrammes sont faits en Mermaid.

@@ -25,6 +25,8 @@ async fn every_response_carries_the_security_headers() {
         (Method::GET, "/", StatusCode::OK),
         (Method::GET, "/camstream.js", StatusCode::OK),
         (Method::GET, "/camstream.css", StatusCode::OK),
+        (Method::GET, "/favicon.svg", StatusCode::OK),
+        (Method::GET, "/logo.svg", StatusCode::OK),
         (Method::GET, "/health", StatusCode::OK),
         (Method::GET, "/stream.mjpg", StatusCode::OK),
         (Method::GET, "/nope", StatusCode::NOT_FOUND),
@@ -81,6 +83,28 @@ async fn the_page_works_under_the_policy() {
         style.headers()[header::CONTENT_TYPE],
         "text/css; charset=utf-8"
     );
-    assert!(body_text(style).await.contains("img.waiting"));
+    assert!(body_text(style).await.contains("#stream.waiting"));
+
+    // Icône et logo : de même origine (`img-src 'self'`), type SVG exact, sans
+    // `<style>` interne que `style-src 'self'` bloquerait.
+    assert!(page.contains(r#"<link rel="icon" href="/favicon.svg" type="image/svg+xml">"#));
+    assert!(page.contains(r#"src="/logo.svg""#));
+    for path in ["/favicon.svg", "/logo.svg"] {
+        let response = get(app.addr, path).await;
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "image/svg+xml",
+            "{path}"
+        );
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "no-cache",
+            "{path}"
+        );
+        let body = body_text(response).await;
+        assert!(body.starts_with("<svg"), "{path}");
+        assert!(!body.contains("<style"), "{path}");
+        assert!(!body.contains("<script"), "{path}");
+    }
     assert_eq!(app.stop().await, camstream::app::Outcome::Stopped);
 }

@@ -1,5 +1,6 @@
-//! Routeur axum : `/` (et ses fichiers `/camstream.js`, `/camstream.css`),
-//! `/stream.mjpg`, `/health` ; toute autre route : `404`. Les en-têtes de sécurité
+//! Routeur axum : `/` (et ses fichiers `/camstream.js`, `/camstream.css`,
+//! `/favicon.svg`, `/logo.svg`), `/stream.mjpg`, `/health` ;
+//! toute autre route : `404`. Les en-têtes de sécurité
 //! sont ajoutés à toutes les réponses, `404` comprises.
 
 use axum::http::header;
@@ -20,6 +21,10 @@ const INDEX_HTML: &str = include_str!("index.html");
 const INDEX_JS: &str = include_str!("camstream.js");
 /// Style de la page (fichier séparé : la CSP interdit les styles en ligne).
 const INDEX_CSS: &str = include_str!("camstream.css");
+/// Icône de l'application (favicon), source unique partagée avec la documentation.
+const FAVICON_SVG: &str = include_str!("../../assets/logo/camstream-icon.svg");
+/// Logo avec le nom, variante pour fond sombre (sans `<style>` : la CSP l'interdirait).
+const LOGO_SVG: &str = include_str!("../../assets/logo/camstream-logo-dark.svg");
 
 /// État partagé par les handlers (clones peu coûteux : canaux et `Arc`).
 ///
@@ -45,6 +50,8 @@ pub(crate) fn router(state: ServerState) -> Router {
         .route("/", get(index))
         .route("/camstream.js", get(script))
         .route("/camstream.css", get(stylesheet))
+        .route("/favicon.svg", get(favicon))
+        .route("/logo.svg", get(logo))
         .route("/stream.mjpg", get(mjpeg::stream))
         .route("/health", get(health::health))
         .with_state(state)
@@ -76,5 +83,28 @@ async fn stylesheet() -> impl IntoResponse {
             (header::CACHE_CONTROL, "no-cache"),
         ],
         INDEX_CSS,
+    )
+}
+
+/// Handler `GET /favicon.svg` : icône de l'onglet.
+async fn favicon() -> impl IntoResponse {
+    svg(FAVICON_SVG)
+}
+
+/// Handler `GET /logo.svg` : logo affiché en tête de page.
+async fn logo() -> impl IntoResponse {
+    svg(LOGO_SVG)
+}
+
+/// Réponse SVG statique (type MIME exact : requis avec `nosniff`). `no-cache` comme
+/// les autres ressources de la page : après une mise à jour du binaire, le navigateur
+/// revalide et n'affiche pas un ancien logo (quelques Ko sur un réseau local).
+fn svg(body: &'static str) -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "image/svg+xml"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        body,
     )
 }

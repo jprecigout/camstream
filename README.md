@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo/camstream-logo-dark.svg">
+    <img src="assets/logo/camstream-logo.svg" alt="Camstream" width="420">
+  </picture>
+</p>
+
 # Camstream
 
 Camstream capture le flux d'une **webcam USB** (V4L2) et le diffuse dans un **navigateur web**,
@@ -73,9 +80,18 @@ Un [`docker-compose.yml`](docker-compose.yml) d'exemple est fourni.
 
 | Route | Rôle |
 |---|---|
-| `GET /` | Page HTML affichant le flux (« Démarrage de la caméra… » jusqu'à la première image) ; script et style servis par `GET /camstream.js` et `GET /camstream.css` |
+| `GET /` | Page HTML affichant le flux (« Démarrage de la caméra… » jusqu'à la première image) ; script, style, icône et logo servis par `GET /camstream.js`, `GET /camstream.css`, `GET /favicon.svg` et `GET /logo.svg` |
 | `GET /stream.mjpg` | Flux MJPEG `multipart/x-mixed-replace` ; `503` au-delà de la limite de clients |
 | `GET /health` | État JSON, ex. `{"status":"ok","camera":{"state":"idle"},"clients":0}` ; `503` si la capture a échoué |
+
+## Logo
+
+Les fichiers du logo sont dans [`assets/logo/`](assets/logo/) : icône seule
+(`camstream-icon.svg`, `camstream-icon-512.png`), logo avec le nom pour fond clair
+(`camstream-logo.svg`, qui passe en texte clair en mode sombre ; `camstream-logo.png`) et pour
+fond sombre (`camstream-logo-dark.svg`, `camstream-logo-dark.png`). Couleurs : dégradé
+`#7B2FF7` → `#F72585` → `#FF8C42` sur fond nuit `#0B0B1A`. L'icône et la variante sombre
+sont embarquées dans le binaire (`/favicon.svg`, `/logo.svg`).
 
 ## Configuration
 

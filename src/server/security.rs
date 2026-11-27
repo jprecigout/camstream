@@ -18,7 +18,8 @@ use axum::response::Response;
 ///
 /// Tout est interdit par défaut ; seules les ressources de la même origine
 /// nécessaires à la page sont permises : `/camstream.js` (pas de script en ligne),
-/// `/camstream.css` (pas de style en ligne), `/stream.mjpg` (image) ; aucune requête
+/// `/camstream.css` (pas de style en ligne), `/stream.mjpg`, `/favicon.svg` et
+/// `/logo.svg` (images) ; aucune requête
 /// `fetch`, aucun cadre, aucun formulaire.
 pub const CONTENT_SECURITY_POLICY_VALUE: &str = "default-src 'none'; script-src 'self'; \
      style-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; \

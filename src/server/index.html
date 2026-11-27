@@ -5,10 +5,14 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Camstream</title>
 <!-- Ni script ni style en ligne : la politique CSP (script-src 'self') l'interdit. -->
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/camstream.css">
 <script src="/camstream.js" defer></script>
 </head>
 <body>
+<header>
+  <img class="logo" src="/logo.svg" alt="Camstream" width="172" height="48">
+</header>
 <main>
   <!-- Le flux MJPEG est affiché nativement par la balise img, sans JavaScript. -->
   <img id="stream" class="waiting" src="/stream.mjpg" alt="Flux de la webcam">
