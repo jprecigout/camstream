@@ -85,7 +85,12 @@ impl<'a> Banner<'a> {
             ("version", format!("v{}", self.version)),
             (
                 "source",
-                format!("{source} ({} @ {} fps)", capture.resolution, capture.fps),
+                // Valeurs **demandées** : le format effectif, négocié avec la caméra, est
+                // journalisé à l'ouverture et exposé par `/health`.
+                format!(
+                    "{source} (requested {} @ {} fps, format {})",
+                    capture.resolution, capture.fps, capture.format
+                ),
             ),
             ("stream", url.clone()),
             ("health", format!("{url}health")),
@@ -191,7 +196,7 @@ mod tests {
         assert!(!text.contains('\x1b'));
         assert!(text.contains(ART[2]));
         assert!(text.contains("v1.2.3"));
-        assert!(text.contains("synthetic test pattern (640x480 @ 15 fps)"));
+        assert!(text.contains("synthetic test pattern (requested 640x480 @ 15 fps, format auto)"));
         assert!(text.contains("http://127.0.0.1:9000/"));
         assert!(text.contains("http://127.0.0.1:9000/health"));
     }

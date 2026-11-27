@@ -4,7 +4,9 @@
 //! appliqués : troncature à `bytesused`, délai de `poll` borné, `Timeout` classé
 //! `Reopen` (`EINVAL` après `TimedOut`), `Drop` de `v4l` sous `catch_unwind`,
 //! classification des `errno`. Les paniques de `v4l` hors `Drop` (ouverture,
-//! configuration, allocation, lecture) sont aussi interceptées (`guard`).
+//! énumération, configuration, allocation, lecture) sont aussi interceptées (`guard`).
+//! Format, résolution et cadence sont négociés sur les capacités énumérées ; les
+//! formats bruts sont convertis en JPEG dans `next_frame` (ADR 0008).
 
 mod device;
 mod errno;
@@ -12,7 +14,7 @@ mod guard;
 mod release;
 mod source;
 
-pub use device::{Configured, Opened, V4l2Device};
+pub use device::{Configured, DeviceCapabilities, Opened, V4l2Device};
 pub use source::V4l2Source;
 
 use crate::domain::{CaptureError, CaptureSettings};

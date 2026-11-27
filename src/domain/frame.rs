@@ -127,22 +127,51 @@ impl SequenceNumber {
     }
 }
 
+/// Disposition des filtres colorés d'un capteur Bayer : couleurs des deux premiers
+/// pixels de la première ligne puis de la deuxième ligne (motif 2x2 répété).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BayerPattern {
+    /// `B G / G R` (FourCC V4L2 `BA81`).
+    Bggr,
+    /// `G B / R G` (FourCC `GBRG`).
+    Gbrg,
+    /// `G R / B G` (FourCC `GRBG`).
+    Grbg,
+    /// `R G / G B` (FourCC `RGGB`).
+    Rggb,
+}
+
 /// Format de pixels négocié avec le périphérique.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PixelFormat {
     /// Images JPEG compressées par la webcam (format privilégié, sans ré-encodage).
     Mjpeg,
-    /// Format brut YUV 4:2:2 (repli, nécessite un encodage JPEG logiciel ; phase 2).
+    /// Format brut YUV 4:2:2 entrelacé (`Y0 U Y1 V`), converti puis encodé en JPEG
+    /// par logiciel (ADR 0008).
     Yuyv,
+    /// Mosaïque Bayer brute 8 bits par photosite, débayerisée puis encodée en JPEG par
+    /// logiciel (ADR 0008).
+    Bayer8(BayerPattern),
 }
 
 impl PixelFormat {
-    /// Nom court stable (`MJPEG`, `YUYV`), utilisé dans les logs et `/health`.
+    /// Nom court stable, utilisé dans les logs et `/health` : `MJPEG`, `YUYV`, ou le
+    /// FourCC V4L2 du format Bayer (`BA81`, `GBRG`, `GRBG`, `RGGB`), tel qu'affiché par
+    /// `v4l2-ctl --list-formats-ext`.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Mjpeg => "MJPEG",
             Self::Yuyv => "YUYV",
+            Self::Bayer8(BayerPattern::Bggr) => "BA81",
+            Self::Bayer8(BayerPattern::Gbrg) => "GBRG",
+            Self::Bayer8(BayerPattern::Grbg) => "GRBG",
+            Self::Bayer8(BayerPattern::Rggb) => "RGGB",
         }
+    }
+
+    /// Vrai si les trames du périphérique sont déjà des JPEG (aucun encodage logiciel).
+    pub fn is_compressed(self) -> bool {
+        self == Self::Mjpeg
     }
 }
 
@@ -150,6 +179,46 @@ impl PixelFormat {
 impl fmt::Display for PixelFormat {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+/// Qualité d'encodage JPEG logiciel, de 1 (plus compact) à 100 (meilleure image)
+/// (**Newtype**).
+///
+/// Sous 90, l'encodeur sous-échantillonne la chrominance (4:2:0), ce qui réduit le
+/// coût CPU et la taille des trames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct JpegQuality(u8);
+
+impl JpegQuality {
+    /// Qualité par défaut : 80, bon compromis netteté / débit / CPU sur Raspberry Pi.
+    pub const DEFAULT: Self = Self(80);
+
+    /// Construit une qualité ; `None` hors de `1..=100`.
+    pub const fn new(quality: u8) -> Option<Self> {
+        if matches!(quality, 1..=100) {
+            Some(Self(quality))
+        } else {
+            None
+        }
+    }
+
+    /// Valeur de 1 à 100.
+    pub fn get(self) -> u8 {
+        self.0
+    }
+}
+
+impl Default for JpegQuality {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// Affiche la valeur numérique.
+impl fmt::Display for JpegQuality {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 
@@ -175,6 +244,23 @@ impl Frame {
             resolution,
             sequence,
             captured_at: Instant::now(),
+        }
+    }
+
+    /// Construit une trame en précisant l'instant de capture : celui du retrait du
+    /// tampon du pilote, **avant** une éventuelle conversion logicielle, pour que la
+    /// latence mesurée inclue le coût de l'encodage JPEG.
+    pub fn captured(
+        data: Bytes,
+        resolution: Resolution,
+        sequence: SequenceNumber,
+        captured_at: Instant,
+    ) -> Self {
+        Self {
+            data,
+            resolution,
+            sequence,
+            captured_at,
         }
     }
 
@@ -263,5 +349,34 @@ mod tests {
         assert_eq!(clone.data().as_ptr(), frame.data().as_ptr());
         assert_eq!(clone.sequence().get(), 7);
         assert_eq!(PixelFormat::Mjpeg.to_string(), "MJPEG");
+    }
+
+    #[test]
+    fn pixel_formats_have_v4l2_names() {
+        let names: Vec<_> = [PixelFormat::Mjpeg, PixelFormat::Yuyv]
+            .into_iter()
+            .chain(
+                [
+                    BayerPattern::Bggr,
+                    BayerPattern::Gbrg,
+                    BayerPattern::Grbg,
+                    BayerPattern::Rggb,
+                ]
+                .map(PixelFormat::Bayer8),
+            )
+            .map(PixelFormat::as_str)
+            .collect();
+        assert_eq!(names, ["MJPEG", "YUYV", "BA81", "GBRG", "GRBG", "RGGB"]);
+        assert!(PixelFormat::Mjpeg.is_compressed());
+        assert!(!PixelFormat::Bayer8(BayerPattern::Grbg).is_compressed());
+    }
+
+    #[test]
+    fn jpeg_quality_is_bounded() {
+        assert!(JpegQuality::new(0).is_none());
+        assert!(JpegQuality::new(101).is_none());
+        assert_eq!(JpegQuality::new(1).unwrap().get(), 1);
+        assert_eq!(JpegQuality::new(100).unwrap().get(), 100);
+        assert_eq!(JpegQuality::default().get(), 80);
     }
 }

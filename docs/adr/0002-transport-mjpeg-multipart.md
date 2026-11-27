@@ -70,11 +70,20 @@ Points de conception :
 > trames sont vérifiées (`SOI`/`EOI`, bourrage final retiré) avant diffusion, sans décodage
 > (`capture::jpeg`).
 
+> **Complément (formats bruts, 2026-11-27)** : la caméra de l'utilisateur ne fournit que du
+> Bayer `GRBG` (162x120, 324x240). Le transport est inchangé ; les formats non compressés
+> (YUYV, Bayer 8 bits) sont désormais convertis en JPEG **dans l'adaptateur de capture**
+> (stratégie `FrameEncoder`, `src/capture/convert/`), ce qui préserve le contrat « trames
+> JPEG » du port `FrameSource`. MJPEG natif reste prioritaire (aucun ré-encodage). Voir
+> [ADR 0008](0008-formats-bruts-et-conversion-jpeg.md).
+
 ## Conséquences
 
-- Le contrat du port `FrameSource` impose des trames **JPEG** : le format YUYV de repli doit
-  être converti en JPEG dans l'adaptateur de capture (seul cas de ré-encodage, coûteux et
-  donc limité au repli ; voir [architecture](../architecture.md#format-yuyv-de-repli)).
+- Le contrat du port `FrameSource` impose des trames **JPEG** : les formats bruts de repli
+  (YUYV, Bayer 8 bits) sont convertis en JPEG dans l'adaptateur de capture (seul cas
+  d'encodage, coûteux et donc limité au repli ; voir
+  [architecture](../architecture.md#formats-bruts-et-conversion-jpeg) et
+  [ADR 0008](0008-formats-bruts-et-conversion-jpeg.md)).
 - Le débit réseau est le facteur limitant : résolution et FPS par défaut prudents
   (640x480 à 15 i/s).
 - L'ajout ultérieur d'un transport WebSocket ou WebRTC se fera par un **nouvel adaptateur**

@@ -7,6 +7,14 @@ pub mod device;
 pub mod frame;
 pub mod source;
 
-pub use device::{CaptureSettings, DevicePath, FormatPreference, SourceKind};
-pub use frame::{Fps, Frame, ParseResolutionError, PixelFormat, Resolution, SequenceNumber};
-pub use source::{CaptureError, FrameSource, FrameSourceFactory, Recovery, SourceDescription};
+pub use device::{
+    CaptureSettings, DevicePath, EncodingSettings, FormatPreference, SourceKind, WhiteBalance,
+};
+pub use frame::{
+    BayerPattern, Fps, Frame, JpegQuality, ParseResolutionError, PixelFormat, Resolution,
+    SequenceNumber,
+};
+pub use source::{
+    CaptureError, FpsOrigin, FrameEncoding, FrameSource, FrameSourceFactory, Recovery,
+    SourceDescription,
+};

@@ -25,6 +25,7 @@ les écarts avec la conception initiale sont listés dans
 | [0005](adr/0005-image-docker-et-compilation-arm64.md) | Image Docker et compilation pour arm64 (cible unique) | Proposé |
 | [0006](adr/0006-capture-a-la-demande.md) | Capture à la demande | Proposé |
 | [0007](adr/0007-securite-reseau-local-v1.md) | Sécurité de la v1 : réseau local, sans authentification ni TLS | Proposé |
+| [0008](adr/0008-formats-bruts-et-conversion-jpeg.md) | Formats bruts (Bayer, YUYV), négociation automatique et conversion JPEG sur le Pi | Proposé |
 
 ## Spikes
 

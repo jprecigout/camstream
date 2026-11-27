@@ -227,6 +227,8 @@ services:
       CAMSTREAM_FPS: "15"
       CAMSTREAM_MAX_CLIENTS: "10"
       CAMSTREAM_IDLE_TIMEOUT_MS: "10000"
+      CAMSTREAM_FORMAT: auto          # MJPEG natif, sinon YUYV ou Bayer convertis en JPEG
+      CAMSTREAM_JPEG_QUALITY: "80"    # formats bruts uniquement (docs/adr/0008)
       # CAMSTREAM_SOURCE: synthetic   # mire de test, pour valider le déploiement sans webcam
       RUST_LOG: info
     read_only: true
@@ -253,9 +255,9 @@ l'environnement. Les valeurs invalides provoquent un arrêt immédiat avec un me
 |---|---|---|---|
 | `CAMSTREAM_SOURCE` | `--source` | `v4l2` | Type de source : `v4l2` ou `synthetic` (mire de test, sans webcam) |
 | `CAMSTREAM_DEVICE` | `--device` | `/dev/video0` | Périphérique V4L2 |
-| `CAMSTREAM_RESOLUTION` | `--resolution` | `640x480` | Résolution demandée (`LARGEURxHAUTEUR`) |
-| `CAMSTREAM_FPS` | `--fps` | `15` | Cadence demandée (1 à 120) |
-| `CAMSTREAM_FORMAT` | `--format` | `auto` | `auto`, `mjpeg`, `yuyv`. En v1, MJPEG est obligatoire : `auto` équivaut à `mjpeg` (webcam sans MJPEG → erreur fatale) et `yuyv` est refusé ; le repli YUYV arrive en phase 2 |
+| `CAMSTREAM_RESOLUTION` | `--resolution` | `640x480` | Résolution **demandée** (`LARGEURxHAUTEUR`) : la plus grande taille proposée par la caméra qui y tient (largeur et hauteur) est retenue, sinon la plus petite au-dessus. Caméra de l'utilisateur (`GRBG` 162x120 / 324x240) : **324x240** |
+| `CAMSTREAM_FPS` | `--fps` | `15` | Cadence **demandée** (1 à 120) : la cadence proposée la plus proche est retenue (la plus basse en cas d'égalité) ; si la caméra n'énumère pas ses cadences, la demande est transmise au pilote |
+| `CAMSTREAM_FORMAT` | `--format` | `auto` | `auto` : MJPEG natif si proposé (aucun ré-encodage), sinon YUYV, sinon Bayer 8 bits (`BA81`, `GBRG`, `GRBG`, `RGGB`), convertis en JPEG sur le Pi. `mjpeg`, `yuyv`, `bayer` exigent le format : s'il n'est pas proposé, **erreur fatale au démarrage** (code 1) dont le message liste les formats et tailles de la caméra. Avec `CAMSTREAM_SOURCE=synthetic`, `bayer` (ou `yuyv`) produit une mire brute convertie en JPEG qui imite la caméra de l'utilisateur ([ADR 0008](adr/0008-formats-bruts-et-conversion-jpeg.md)) |
 | `CAMSTREAM_READ_TIMEOUT_MS` | `--read-timeout-ms` | `2000` | Délai maximal d'attente d'une trame ; au-delà, la webcam est considérée figée et rouverte (doit dépasser l'intervalle entre images **et rester inférieur à `CAMSTREAM_SHUTDOWN_TIMEOUT_MS`**, sinon code 2) |
 | `CAMSTREAM_MAX_CORRUPTED_FRAMES` | `--max-corrupted-frames` | `30` | Trames invalides (JPEG tronqué, erreur du pilote) **consécutives** tolérées avant de rouvrir la webcam (≈ 2 s à 15 i/s) ; le compteur repart de zéro à chaque trame valide |
 | `CAMSTREAM_IDLE_TIMEOUT_MS` | `--idle-timeout-ms` | `10000` | Délai de grâce avant d'éteindre la webcam quand plus aucun client ne regarde (`0` : immédiat) |
@@ -267,11 +269,31 @@ l'environnement. Les valeurs invalides provoquent un arrêt immédiat avec un me
 | `CAMSTREAM_RECONNECT_MAX_MS` | `--reconnect-max-ms` | `30000` | Attente maximale entre deux tentatives (≥ attente initiale) |
 | `CAMSTREAM_SHUTDOWN_TIMEOUT_MS` | `--shutdown-timeout-ms` | `5000` | Délai maximal de l'arrêt gracieux (doit dépasser le délai de lecture) |
 | `CAMSTREAM_HEALTHCHECK_TIMEOUT_MS` | `healthcheck --timeout-ms` | `2000` | Durée **totale** maximale de la sonde `healthcheck` (connexion, envoi, lecture) ; à garder sous le `--timeout` du `HEALTHCHECK` (3 s) |
-| `CAMSTREAM_JPEG_QUALITY` | — | — | **Non implémentée en v1** : qualité JPEG du repli YUYV, prévue en phase 2 |
+| `CAMSTREAM_JPEG_QUALITY` | `--jpeg-quality` | `80` | Qualité JPEG (1 à 100) de l'encodage logiciel des formats bruts ; ignorée en MJPEG natif. Sous 90, chrominance sous-échantillonnée (moins de CPU et de débit) |
+| `CAMSTREAM_WHITE_BALANCE` | `--white-balance` | `gray-world` | Balance des blancs des formats **Bayer** : `gray-world` (automatique « monde gris », lissée) ou `off` (couleurs brutes du capteur) ; sans effet en YUYV et MJPEG |
 | `CAMSTREAM_NO_BANNER` | `--no-banner` | `false` | Désactive la bannière de démarrage (nom en couleurs, version, source, URL du flux), affichée sur la sortie standard avant les logs ; couleurs seulement sur un terminal, hors `TERM=dumb` et sans `NO_COLOR` |
 | `RUST_LOG` | — | `info` | Filtre `tracing` (ex. `camstream=debug`) |
 
-Les défauts 640x480, 15 i/s et 10 clients sont confirmés (moins de 10 spectateurs prévus).
+Les défauts 640x480, 15 i/s et 10 clients sont confirmés (moins de 10 spectateurs prévus) ;
+640x480 et 15 i/s sont des **demandes**, ajustées à l'offre de la caméra.
+
+Format et résolution effectifs : log `info` « camera formats detected » (offre de la caméra)
+puis « capture format selected » à chaque ouverture, et `/health` en état `streaming`
+(`pixel_format`, `resolution`, `fps`, `fps_origin` = `confirmed` ou `requested` quand le
+pilote ne permet pas de régler la cadence, `encoding` = `native` ou `software`, `jpeg_quality`).
+Exemple avec la caméra de l'utilisateur :
+
+```json
+{"status":"ok","camera":{"state":"streaming","source":{"name":"…","pixel_format":"GRBG",
+ "resolution":"324x240","fps":15,"fps_origin":"requested","encoding":"software",
+ "jpeg_quality":80}},"clients":1}
+```
+
+Coût CPU de la conversion des formats bruts (thread `camstream-capture`) : estimé à 5 à 8 %
+d'un cœur de Pi 4 en `GRBG` 324x240 à 15 i/s, à confirmer sur le Pi
+([ADR 0008](adr/0008-formats-bruts-et-conversion-jpeg.md#mesures-estimations-à-confirmer-sur-le-pi)) ;
+pour le mesurer sans caméra : `CAMSTREAM_SOURCE=synthetic CAMSTREAM_FORMAT=bayer` puis
+`top -H` pendant qu'un navigateur regarde le flux.
 Ordre de grandeur réseau : un flux MJPEG 640x480 à 15 i/s représente environ 0,5 à 1 Mo/s
 (4 à 8 Mbit/s) **par client** ; quelques spectateurs simultanés restent compatibles avec le
 Wi-Fi d'un Pi.
@@ -279,7 +301,8 @@ Wi-Fi d'un Pi.
 ## 6. Accès à la webcam et droits
 
 1. Vérifier la webcam sur l'hôte : `v4l2-ctl --list-devices` puis
-   `v4l2-ctl -d /dev/video0 --list-formats-ext` (présence de `MJPG`).
+   `v4l2-ctl -d /dev/video0 --list-formats-ext` (`MJPG` est relayé sans ré-encodage ; à défaut,
+   `YUYV` ou Bayer 8 bits `BA81`/`GBRG`/`GRBG`/`RGGB` sont convertis en JPEG sur le Pi).
 2. Vérifier le groupe du nœud : `stat -c '%G %g' /dev/video0` (attendu : `video 44`).
 3. Si le GID diffère de celui du groupe `video` de l'image, utiliser le GID numérique dans
    `group_add`.

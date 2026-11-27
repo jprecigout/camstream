@@ -99,6 +99,18 @@ Contraintes :
 >   sonde avec abonnés, reconnexion abandonnée sans spectateur, annulation d'une longue
 >   attente) avec une fabrique scriptée.
 
+> **Complément (formats bruts, 2026-11-27, [ADR 0008](0008-formats-bruts-et-conversion-jpeg.md))** :
+>
+> - la sonde de démarrage **négocie** désormais format, résolution et cadence sur les
+>   capacités énumérées : un `CAMSTREAM_FORMAT` explicite impossible (par exemple `mjpeg`
+>   avec la caméra `GRBG` de l'utilisateur) donne `UnsupportedFormat` **dès le démarrage**
+>   (fatale, code 1), avec la liste des formats proposés dans le message et dans `/health` ;
+> - avec un format brut, la conversion JPEG continue **pendant le délai de grâce** (trames
+>   converties puis jetées, coût CPU de quelques pour cent d'un cœur au plus pendant 10 s
+>   par défaut). Accepté ; évolution possible : sauter la conversion sans abonné ;
+> - l'offre de la caméra et le choix sont journalisés (`info`) à chaque ouverture, donc à
+>   chaque premier spectateur après une période `Idle`.
+
 ## Conséquences
 
 - Nouvel état `SourceStatus::Idle` et nouveaux types `DemandReceiver`, `SupervisorSettings`

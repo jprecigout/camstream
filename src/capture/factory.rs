@@ -1,8 +1,11 @@
 //! Fabrique concrète des sources vidéo selon la configuration.
 
-use crate::domain::{CaptureError, CaptureSettings, FrameSource, FrameSourceFactory, SourceKind};
+use crate::domain::{
+    CaptureError, CaptureSettings, FormatPreference, FrameSource, FrameSourceFactory, SourceKind,
+};
 
 use super::synthetic::SyntheticSource;
+use super::synthetic_raw::SyntheticRawSource;
 
 /// Fabrique concrète choisissant l'adaptateur selon `CaptureSettings::kind`.
 ///
@@ -29,11 +32,20 @@ impl SourceFactory {
 impl FrameSourceFactory for SourceFactory {
     /// Ouvre, configure et démarre la source demandée.
     ///
-    /// Sans la feature `v4l2`, demander une webcam donne
-    /// [`CaptureError::SourceNotAvailable`] (fatale, visible dès la sonde).
+    /// Mire synthétique : JPEG pré-encodés en `auto`/`mjpeg`, mire brute convertie
+    /// en JPEG (`SyntheticRawSource`) en `bayer`/`yuyv`. Sans la feature `v4l2`,
+    /// demander une webcam donne [`CaptureError::SourceNotAvailable`] (fatale, visible
+    /// dès la sonde).
     fn create(&self) -> Result<Box<dyn FrameSource>, CaptureError> {
         match self.settings.kind {
-            SourceKind::Synthetic => Ok(Box::new(SyntheticSource::new(self.settings.fps))),
+            SourceKind::Synthetic => match self.settings.format {
+                FormatPreference::Auto | FormatPreference::Mjpeg => {
+                    Ok(Box::new(SyntheticSource::new(self.settings.fps)))
+                }
+                FormatPreference::Bayer | FormatPreference::Yuyv => {
+                    Ok(Box::new(SyntheticRawSource::open(&self.settings)?))
+                }
+            },
             #[cfg(feature = "v4l2")]
             SourceKind::V4l2 => Ok(Box::new(super::v4l2::open_source(&self.settings)?)),
             #[cfg(not(feature = "v4l2"))]
@@ -47,7 +59,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::domain::{DevicePath, FormatPreference, Fps, Recovery, Resolution};
+    use crate::domain::{DevicePath, EncodingSettings, Fps, PixelFormat, Recovery, Resolution};
 
     fn settings(kind: SourceKind) -> CaptureSettings {
         CaptureSettings {
@@ -56,6 +68,7 @@ mod tests {
             resolution: Resolution::new(640, 480).unwrap(),
             fps: Fps::new(30).unwrap(),
             format: FormatPreference::Auto,
+            encoding: EncodingSettings::default(),
             read_timeout: Duration::from_secs(2),
         }
     }
@@ -66,6 +79,21 @@ mod tests {
         let mut source = factory.create().unwrap();
         assert_eq!(source.description().fps.get(), 30);
         assert!(source.next_frame().is_ok());
+        assert_eq!(source.description().pixel_format, PixelFormat::Mjpeg);
+    }
+
+    #[test]
+    fn creates_a_raw_synthetic_source_for_raw_formats() {
+        for (format, expected) in [
+            (FormatPreference::Bayer, "GRBG"),
+            (FormatPreference::Yuyv, "YUYV"),
+        ] {
+            let mut settings = settings(SourceKind::Synthetic);
+            settings.format = format;
+            let mut source = SourceFactory::new(settings).create().unwrap();
+            assert_eq!(source.description().pixel_format.as_str(), expected);
+            assert!(source.next_frame().is_ok());
+        }
     }
 
     #[test]

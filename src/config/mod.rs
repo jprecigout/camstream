@@ -13,7 +13,9 @@ use std::time::Duration;
 
 use clap::Parser;
 
-use crate::domain::{CaptureSettings, DevicePath, FormatPreference, Fps};
+use crate::domain::{
+    CaptureSettings, DevicePath, EncodingSettings, FormatPreference, Fps, JpegQuality,
+};
 use cli::{Cli, CliCommand, ServeArgs};
 
 /// Capacité maximale acceptée pour le tampon de diffusion (mémoire du Pi).
@@ -118,12 +120,11 @@ impl AppConfig {
     /// Valide les arguments et construit la configuration.
     fn from_args(bind: SocketAddr, args: ServeArgs) -> Result<Self, ConfigError> {
         let format = FormatPreference::from(args.format);
-        if format == FormatPreference::Yuyv {
-            return Err(ConfigError::Invalid(
-                "--format yuyv is not supported yet (phase 2): the camera must deliver MJPEG"
-                    .into(),
-            ));
-        }
+        // Le parseur clap borne déjà la qualité à 1..=100 : `JpegQuality::new` ne peut
+        // échouer.
+        let quality = JpegQuality::new(args.jpeg_quality).ok_or_else(|| {
+            ConfigError::Invalid("--jpeg-quality must be between 1 and 100".into())
+        })?;
         // Le parseur clap borne déjà la cadence à 1..=120 : `Fps::new` ne peut échouer.
         let fps = Fps::new(args.fps)
             .ok_or_else(|| ConfigError::Invalid("--fps must be at least 1".into()))?;
@@ -167,6 +168,10 @@ impl AppConfig {
                 resolution: args.resolution,
                 fps,
                 format,
+                encoding: EncodingSettings {
+                    quality,
+                    white_balance: args.white_balance.into(),
+                },
                 read_timeout,
             },
             bind,
@@ -223,6 +228,11 @@ mod tests {
         assert_eq!(config.capture.resolution.to_string(), "640x480");
         assert_eq!(config.capture.fps.get(), 15);
         assert_eq!(config.capture.format, FormatPreference::Auto);
+        assert_eq!(config.capture.encoding.quality.get(), 80);
+        assert_eq!(
+            config.capture.encoding.white_balance,
+            crate::domain::WhiteBalance::GrayWorld
+        );
         assert_eq!(config.capture.read_timeout, Duration::from_millis(2000));
         assert_eq!(config.idle_timeout, Duration::from_secs(10));
         assert_eq!(config.max_clients.get(), 10);
@@ -267,6 +277,35 @@ mod tests {
         assert_eq!(config.idle_timeout, Duration::ZERO);
         assert_eq!(config.max_clients.get(), 3);
         assert_eq!(config.hub_capacity.get(), 8);
+    }
+
+    #[test]
+    fn raw_formats_and_encoding_are_configurable() {
+        for (value, expected) in [
+            ("yuyv", FormatPreference::Yuyv),
+            ("bayer", FormatPreference::Bayer),
+            ("auto", FormatPreference::Auto),
+        ] {
+            assert_eq!(
+                serve(&["--format", value]).unwrap().capture.format,
+                expected
+            );
+        }
+        let config = serve(&["--jpeg-quality", "65", "--white-balance", "off"]).unwrap();
+        assert_eq!(config.capture.encoding.quality.get(), 65);
+        assert_eq!(
+            config.capture.encoding.white_balance,
+            crate::domain::WhiteBalance::Off
+        );
+        for quality in ["0", "101", "high"] {
+            assert!(
+                matches!(
+                    serve(&["--jpeg-quality", quality]),
+                    Err(ConfigError::Parse(_))
+                ),
+                "{quality}"
+            );
+        }
     }
 
     #[test]
@@ -318,8 +357,7 @@ mod tests {
     #[test]
     fn inconsistent_values_are_rejected() {
         for args in [
-            &["--format", "yuyv"][..],
-            &["--fps", "1", "--read-timeout-ms", "1000"],
+            &["--fps", "1", "--read-timeout-ms", "1000"][..],
             &["--hub-capacity", "65"],
             &["--max-clients", "1001"],
             // Valeur qui faisait paniquer `Semaphore::new` avant la borne.

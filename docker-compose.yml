@@ -18,6 +18,8 @@ services:
       CAMSTREAM_FPS: "15"
       CAMSTREAM_MAX_CLIENTS: "10"
       CAMSTREAM_IDLE_TIMEOUT_MS: "10000"
+      CAMSTREAM_FORMAT: auto          # MJPEG natif, sinon YUYV ou Bayer convertis en JPEG
+      CAMSTREAM_JPEG_QUALITY: "80"    # formats bruts uniquement (docs/adr/0008)
       # CAMSTREAM_SOURCE: synthetic   # mire de test, pour valider le déploiement sans webcam
       RUST_LOG: info
     read_only: true

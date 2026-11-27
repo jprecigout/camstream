@@ -7,18 +7,23 @@
 
 # Camstream
 
-Camstream capture le flux d'une **webcam USB** (V4L2) et le diffuse dans un **navigateur web**,
-sans ré-encodage : les images JPEG produites par la webcam (MJPEG) sont relayées telles quelles
-en `multipart/x-mixed-replace`, lisible nativement par une simple balise `<img>`.
+Camstream capture le flux d'une **webcam USB** (V4L2) et le diffuse dans un **navigateur web**
+en `multipart/x-mixed-replace`, lisible nativement par une simple balise `<img>`. Les images
+JPEG produites par la webcam (MJPEG) sont relayées **sans ré-encodage** ; une webcam sans
+MJPEG (YUYV, Bayer 8 bits `BA81`/`GBRG`/`GRBG`/`RGGB`) est prise en charge par conversion
+en JPEG sur le Pi.
 
 Conçu pour un **Raspberry Pi** (Raspberry Pi OS 64 bits, `aarch64`) dans **Docker**.
 
 - **Capture à la demande** : la webcam ne s'allume qu'au premier spectateur et s'éteint
   10 s après le départ du dernier.
+- **Négociation automatique** du format, de la résolution et de la cadence parmi ceux que la
+  webcam propose réellement (journalisés au démarrage, exposés par `/health`).
 - **Plusieurs spectateurs** (10 par défaut) ; un client lent saute des images sans ralentir
   les autres.
 - **Reconnexion automatique** de la webcam débranchée puis rebranchée.
-- **Mire de test** intégrée pour essayer sans webcam (`--source synthetic`).
+- **Mire de test** intégrée pour essayer sans webcam (`--source synthetic`, ou
+  `--source synthetic --format bayer` pour une mire Bayer `GRBG` 324x240 convertie en JPEG).
 - Endpoint de santé `/health` et sous-commande `camstream healthcheck` pour Docker.
 
 > **Sécurité** : la v1 n'a **ni authentification ni TLS** (seuls des en-têtes HTTP de
@@ -49,8 +54,11 @@ cargo run --no-default-features -- --source synthetic
 cargo run -- --device /dev/video0 --bind 0.0.0.0 --port 8080
 ```
 
-La webcam doit proposer le format **MJPEG** (`v4l2-ctl -d /dev/video0 --list-formats-ext`) et
-l'utilisateur doit appartenir au groupe `video`. Par défaut, Camstream n'écoute que sur
+Formats pris en charge (`v4l2-ctl -d /dev/video0 --list-formats-ext`) : **MJPEG** de
+préférence (relayé tel quel), sinon **YUYV** ou **Bayer 8 bits** (`BA81`, `GBRG`, `GRBG`,
+`RGGB`), convertis en JPEG sur le Pi. La résolution retenue est la plus grande taille proposée
+qui tient dans la demande (640x480 par défaut) : une caméra `GRBG` 162x120 / 324x240 est ainsi
+diffusée en 324x240 sans configuration. L'utilisateur doit appartenir au groupe `video`. Par défaut, Camstream n'écoute que sur
 `127.0.0.1` : `--bind 0.0.0.0` (ou l'adresse LAN) le rend joignable depuis le réseau local.
 
 ### Avec Docker sur le Raspberry Pi
@@ -82,7 +90,7 @@ Un [`docker-compose.yml`](docker-compose.yml) d'exemple est fourni.
 |---|---|
 | `GET /` | Page HTML affichant le flux (« Démarrage de la caméra… » jusqu'à la première image) ; script, style, icône et logo servis par `GET /camstream.js`, `GET /camstream.css`, `GET /favicon.svg` et `GET /logo.svg` |
 | `GET /stream.mjpg` | Flux MJPEG `multipart/x-mixed-replace` ; `503` au-delà de la limite de clients |
-| `GET /health` | État JSON, ex. `{"status":"ok","camera":{"state":"idle"},"clients":0}` ; `503` si la capture a échoué |
+| `GET /health` | État JSON, ex. `{"status":"ok","camera":{"state":"idle"},"clients":0}` ; en `streaming`, format natif, résolution, cadence et encodage (`native` ou `software`) effectifs ; `503` si la capture a échoué |
 
 ## Logo
 
@@ -102,7 +110,10 @@ Toutes les options existent en ligne de commande et en variable d'environnement
 |---|---|---|
 | `CAMSTREAM_SOURCE` | `v4l2` | `v4l2` ou `synthetic` (mire de test) |
 | `CAMSTREAM_DEVICE` | `/dev/video0` | Périphérique V4L2 |
-| `CAMSTREAM_RESOLUTION` / `CAMSTREAM_FPS` | `640x480` / `15` | Paramètres demandés à la webcam |
+| `CAMSTREAM_RESOLUTION` / `CAMSTREAM_FPS` | `640x480` / `15` | Paramètres **demandés** : la taille et la cadence proposées les plus proches sont retenues |
+| `CAMSTREAM_FORMAT` | `auto` | `auto` (MJPEG natif, sinon YUYV, sinon Bayer), `mjpeg`, `yuyv` ou `bayer` (format exigé : erreur explicite au démarrage s'il manque) |
+| `CAMSTREAM_JPEG_QUALITY` | `80` | Qualité JPEG (1 à 100) des formats bruts encodés sur le Pi |
+| `CAMSTREAM_WHITE_BALANCE` | `gray-world` | Balance des blancs des formats Bayer (`gray-world` ou `off`) |
 | `CAMSTREAM_BIND` / `CAMSTREAM_PORT` | `127.0.0.1` / `8080` | Écoute HTTP (`0.0.0.0` dans l'image Docker) |
 | `CAMSTREAM_IDLE_TIMEOUT_MS` | `10000` | Délai avant d'éteindre la webcam sans spectateur |
 | `CAMSTREAM_MAX_CLIENTS` | `10` | Spectateurs simultanés maximum |
@@ -136,3 +147,9 @@ projet (langues, commentaires, Conventional Commits, revue avant commit) sont da
 | [docs/deploiement.md](docs/deploiement.md) | Docker, Raspberry Pi, accès à la webcam, variables d'environnement, sécurité |
 | [docs/adr/](docs/adr/) | Décisions d'architecture |
 | [docs/spikes/0001-v4l.md](docs/spikes/0001-v4l.md) | Spike sur la crate `v4l` (mesures sur Pi à venir) |
+
+## Licences tierces
+
+L'encodage JPEG des formats bruts utilise la crate
+[`jpeg-encoder`](https://crates.io/crates/jpeg-encoder) (MIT ou Apache-2.0, et licence IJG) :
+*this software is based in part on the work of the Independent JPEG Group*.

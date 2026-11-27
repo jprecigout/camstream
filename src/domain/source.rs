@@ -3,7 +3,7 @@
 use std::fmt;
 
 use super::device::{DevicePath, FormatPreference, SourceKind};
-use super::frame::{Fps, Frame, PixelFormat, Resolution};
+use super::frame::{Fps, Frame, JpegQuality, PixelFormat, Resolution};
 
 /// Source de trames vidéo, indépendante du matériel.
 ///
@@ -14,7 +14,8 @@ use super::frame::{Fps, Frame, PixelFormat, Resolution};
 /// - `next_frame` est **bloquant** : il ne doit être appelé que depuis le thread de
 ///   capture, jamais depuis le runtime tokio ;
 /// - il rend la main au plus tard après le `read_timeout` configuré ;
-/// - les trames renvoyées sont **toujours encodées en JPEG** ;
+/// - les trames renvoyées sont **toujours encodées en JPEG** (les formats bruts sont
+///   convertis par l'adaptateur, dans ce même appel, ADR 0008) ;
 /// - la libération du périphérique se fait à la destruction de la source (**RAII**).
 pub trait FrameSource: Send {
     /// Lit la prochaine trame disponible (bloquant, borné par le délai de lecture).
@@ -53,11 +54,24 @@ pub enum CaptureError {
     /// le nœud de métadonnées `/dev/video1` d'une webcam UVC).
     #[error("not a streaming video capture device: {0}")]
     NotACaptureDevice(DevicePath),
-    /// Aucun format compatible avec la préférence demandée.
-    #[error("no supported pixel format for preference {preference:?}")]
+    /// Aucun format proposé par le périphérique ne correspond à la préférence demandée.
+    #[error("no pixel format matching preference {preference}; the camera offers: {offered}")]
     UnsupportedFormat {
         /// Préférence de format demandée par la configuration.
         preference: FormatPreference,
+        /// Formats et tailles énumérés par le périphérique (ex. « GRBG 162x120,
+        /// 324x240 »), pour un message de diagnostic explicite.
+        offered: String,
+    },
+    /// Résolution négociée inutilisable par la conversion logicielle (mosaïque Bayer
+    /// de moins de 2x2, côté au-delà de 65 535 pixels pour l'encodeur JPEG, image
+    /// au-delà de 4096x4096). Les dimensions impaires sont, elles, prises en charge.
+    #[error("resolution {resolution} cannot be converted to JPEG: {reason}")]
+    UnsupportedResolution {
+        /// Résolution retenue par le pilote.
+        resolution: Resolution,
+        /// Raison du refus.
+        reason: &'static str,
     },
     /// Le type de source demandé n'est pas compilé dans ce binaire (feature Cargo absente).
     #[error("source kind {0} is not available in this build")]
@@ -126,9 +140,33 @@ impl CaptureError {
             Self::PermissionDenied(_)
             | Self::NotACaptureDevice(_)
             | Self::UnsupportedFormat { .. }
+            | Self::UnsupportedResolution { .. }
             | Self::SourceNotAvailable(_) => Recovery::Fatal,
         }
     }
+}
+
+/// Origine de la cadence annoncée dans [`SourceDescription::fps`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FpsOrigin {
+    /// Cadence confirmée par la source (retour de `S_PARM`, ou cadence propre de la
+    /// mire synthétique).
+    Confirmed,
+    /// Cadence seulement **demandée** : le pilote ne permet pas de la régler ni de la
+    /// relire (`S_PARM` refusé) ; la cadence réelle est celle du capteur, inconnue.
+    Requested,
+}
+
+/// Origine des JPEG diffusés.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FrameEncoding {
+    /// JPEG produits par la webcam (MJPEG), relayés sans ré-encodage.
+    Native,
+    /// Trames brutes converties et encodées en JPEG par logiciel, sur le Pi.
+    Software {
+        /// Qualité d'encodage utilisée.
+        quality: JpegQuality,
+    },
 }
 
 /// Caractéristiques effectives d'une source démarrée.
@@ -141,22 +179,34 @@ impl CaptureError {
 pub struct SourceDescription {
     /// Nom lisible (ex. carte de la webcam, « synthetic test pattern »).
     pub name: String,
-    /// Format natif négocié.
+    /// Format natif négocié avec le périphérique (avant conversion éventuelle).
     pub pixel_format: PixelFormat,
     /// Résolution effective.
     pub resolution: Resolution,
-    /// Cadence effective.
+    /// Cadence effective, ou seulement demandée selon [`Self::fps_origin`].
     pub fps: Fps,
+    /// Cadence confirmée par la source ou seulement demandée.
+    pub fps_origin: FpsOrigin,
+    /// Origine des JPEG diffusés (natifs ou encodés par logiciel).
+    pub encoding: FrameEncoding,
 }
 
-/// Résumé sur une ligne, pour les logs (ex. « Webcam (MJPEG 640x480 @ 15 fps) »).
+/// Résumé sur une ligne, pour les logs (ex. « Webcam (MJPEG 640x480 @ 15 fps) » ou
+/// « Cam (GRBG 324x240 @ 15 fps, software JPEG q80) »).
 impl fmt::Display for SourceDescription {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{} ({} {} @ {} fps)",
+            "{} ({} {} @ {} fps",
             self.name, self.pixel_format, self.resolution, self.fps
-        )
+        )?;
+        if self.fps_origin == FpsOrigin::Requested {
+            f.write_str(" requested")?;
+        }
+        match self.encoding {
+            FrameEncoding::Native => f.write_str(")"),
+            FrameEncoding::Software { quality } => write!(f, ", software JPEG q{quality})"),
+        }
     }
 }
 
@@ -192,6 +242,14 @@ mod tests {
             (
                 CaptureError::UnsupportedFormat {
                     preference: FormatPreference::Auto,
+                    offered: "none".into(),
+                },
+                Recovery::Fatal,
+            ),
+            (
+                CaptureError::UnsupportedResolution {
+                    resolution: Resolution::new(1, 1).unwrap(),
+                    reason: "too small",
                 },
                 Recovery::Fatal,
             ),
@@ -221,7 +279,41 @@ mod tests {
             pixel_format: PixelFormat::Mjpeg,
             resolution: Resolution::new(640, 480).unwrap(),
             fps: Fps::new(15).unwrap(),
+            fps_origin: FpsOrigin::Confirmed,
+            encoding: FrameEncoding::Native,
         };
         assert_eq!(description.to_string(), "Cam (MJPEG 640x480 @ 15 fps)");
+        let raw = SourceDescription {
+            pixel_format: PixelFormat::Bayer8(crate::domain::BayerPattern::Grbg),
+            resolution: Resolution::new(324, 240).unwrap(),
+            encoding: FrameEncoding::Software {
+                quality: JpegQuality::DEFAULT,
+            },
+            ..description
+        };
+        assert_eq!(
+            raw.to_string(),
+            "Cam (GRBG 324x240 @ 15 fps, software JPEG q80)"
+        );
+        let unconfirmed = SourceDescription {
+            fps_origin: FpsOrigin::Requested,
+            ..raw
+        };
+        assert_eq!(
+            unconfirmed.to_string(),
+            "Cam (GRBG 324x240 @ 15 fps requested, software JPEG q80)"
+        );
+    }
+
+    #[test]
+    fn unsupported_format_lists_the_offer() {
+        let error = CaptureError::UnsupportedFormat {
+            preference: FormatPreference::Mjpeg,
+            offered: "GRBG 162x120, 324x240".into(),
+        };
+        assert_eq!(
+            error.to_string(),
+            "no pixel format matching preference mjpeg; the camera offers: GRBG 162x120, 324x240"
+        );
     }
 }

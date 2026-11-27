@@ -3,15 +3,16 @@
 //! Les images (640x480) sont pré-encodées et embarquées dans le binaire par
 //! `include_bytes!` (générées par `scripts/generate_synthetic_frames.py`) : aucun
 //! encodage à l'exécution. Utilisable sur le Pi pour valider le déploiement sans
-//! webcam, en développement et en CI.
+//! webcam, en développement et en CI. Variante brute (Bayer, YUYV) convertie en JPEG :
+//! [`super::synthetic_raw`].
 
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 
 use crate::domain::{
-    CaptureError, Fps, Frame, FrameSource, PixelFormat, Resolution, SequenceNumber,
-    SourceDescription,
+    CaptureError, Fps, FpsOrigin, Frame, FrameEncoding, FrameSource, PixelFormat, Resolution,
+    SequenceNumber, SourceDescription,
 };
 
 /// Nom de la source, visible dans les logs et `/health`.
@@ -58,11 +59,10 @@ static FRAMES: [&[u8]; 10] = [
 #[derive(Debug)]
 pub struct SyntheticSource {
     fps: Fps,
-    interval: Duration,
+    pacer: Pacer,
     resolution: Resolution,
     next_index: usize,
     sequence: SequenceNumber,
-    next_deadline: Instant,
 }
 
 impl SyntheticSource {
@@ -71,12 +71,40 @@ impl SyntheticSource {
     pub fn new(fps: Fps) -> Self {
         Self {
             fps,
-            interval: fps.frame_interval(),
+            pacer: Pacer::new(fps),
             resolution: RESOLUTION,
             next_index: 0,
             sequence: SequenceNumber::default(),
+        }
+    }
+}
+
+/// Cadenceur des sources synthétiques : attend l'échéance de la trame suivante.
+#[derive(Debug)]
+pub(crate) struct Pacer {
+    interval: Duration,
+    next_deadline: Instant,
+}
+
+impl Pacer {
+    /// Cadence `fps` ; la première échéance est immédiate.
+    pub(crate) fn new(fps: Fps) -> Self {
+        Self {
+            interval: fps.frame_interval(),
             next_deadline: Instant::now(),
         }
+    }
+
+    /// Bloque jusqu'à l'échéance courante (une période au plus) et programme la
+    /// suivante.
+    pub(crate) fn wait(&mut self) {
+        let now = Instant::now();
+        if let Some(wait) = self.next_deadline.checked_duration_since(now) {
+            std::thread::sleep(wait);
+        }
+        // Cadence régulière sans dérive ; après un retard (thread suspendu, conversion
+        // lente), on repart de maintenant au lieu de rattraper par une rafale de trames.
+        self.next_deadline = (self.next_deadline + self.interval).max(Instant::now());
     }
 }
 
@@ -84,14 +112,7 @@ impl FrameSource for SyntheticSource {
     /// Attend l'échéance de la trame suivante (bloquant, une période au plus) puis
     /// renvoie l'image suivante de la mire.
     fn next_frame(&mut self) -> Result<Frame, CaptureError> {
-        let now = Instant::now();
-        if let Some(wait) = self.next_deadline.checked_duration_since(now) {
-            std::thread::sleep(wait);
-        }
-        // Cadence régulière sans dérive ; après un retard (thread suspendu), on
-        // repart de maintenant au lieu de rattraper par une rafale de trames.
-        self.next_deadline = (self.next_deadline + self.interval).max(Instant::now());
-
+        self.pacer.wait();
         let data = Bytes::from_static(FRAMES[self.next_index]);
         self.next_index = (self.next_index + 1) % FRAMES.len();
         let frame = Frame::new(data, self.resolution, self.sequence);
@@ -105,6 +126,8 @@ impl FrameSource for SyntheticSource {
             pixel_format: PixelFormat::Mjpeg,
             resolution: self.resolution,
             fps: self.fps,
+            fps_origin: FpsOrigin::Confirmed,
+            encoding: FrameEncoding::Native,
         }
     }
 }

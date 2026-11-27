@@ -1,8 +1,10 @@
 # Architecture de Camstream
 
-> Statut : **v1 implémentée** (branche `feat/v1`). Les décisions sont tracées dans les ADR
-> [0001](adr/0001-architecture-hexagonale-et-decoupage-en-modules.md) à
-> [0007](adr/0007-securite-reseau-local-v1.md). Les signatures Rust de ce document reflètent le
+> Statut : **v1 implémentée** (branche `feat/v1`), plus les **formats bruts** (Bayer, YUYV)
+> convertis en JPEG et la négociation automatique (branche `feat/formats-bruts`,
+> [ADR 0008](adr/0008-formats-bruts-et-conversion-jpeg.md)). Les décisions sont tracées dans
+> les ADR [0001](adr/0001-architecture-hexagonale-et-decoupage-en-modules.md) à
+> [0008](adr/0008-formats-bruts-et-conversion-jpeg.md). Les signatures Rust de ce document reflètent le
 > code ; les corps de fonctions sont omis. Les écarts avec la conception initiale sont listés au
 > [§ 11](#11-écarts-entre-la-conception-initiale-et-limplémentation). Toute modification d'un
 > **port** (trait) ou d'une frontière entre modules passe par une revue d'architecture.
@@ -12,13 +14,17 @@
 ## 1. Vue d'ensemble
 
 Camstream lit les trames JPEG d'une webcam USB via V4L2 et les rediffuse, sans ré-encodage,
-à plusieurs navigateurs sous forme de flux MJPEG (`multipart/x-mixed-replace`).
+à plusieurs navigateurs sous forme de flux MJPEG (`multipart/x-mixed-replace`). Si la webcam
+ne propose pas de MJPEG (cas de la caméra de l'utilisateur, Bayer `GRBG` uniquement), les
+trames brutes (YUYV, Bayer 8 bits) sont converties en JPEG sur le Pi, dans le thread de
+capture ([ADR 0008](adr/0008-formats-bruts-et-conversion-jpeg.md)).
 
 Exigences principales :
 
 | Exigence | Réponse architecturale |
 |---|---|
-| Pas de ré-encodage sur le Pi | MJPEG natif de la webcam relayé tel quel ([ADR 0002](adr/0002-transport-mjpeg-multipart.md)) |
+| Pas de ré-encodage sur le Pi | MJPEG natif de la webcam relayé tel quel, choisi en priorité ([ADR 0002](adr/0002-transport-mjpeg-multipart.md)) |
+| Webcam sans MJPEG (Bayer, YUYV) | Négociation sur les capacités énumérées, conversion JPEG logicielle dans l'adaptateur (`FrameEncoder`), contrat « trames JPEG » du port inchangé ([ADR 0008](adr/0008-formats-bruts-et-conversion-jpeg.md)) |
 | Plusieurs clients, clients lents non bloquants | `FrameHub` sur `tokio::sync::broadcast` borné, trames sautées en cas de retard ([ADR 0004](adr/0004-distribution-des-trames-et-concurrence.md)) |
 | Capture V4L2 bloquante | Thread OS dédié, jamais sur le runtime tokio |
 | Webcam débranchée / rebranchée | `CaptureSupervisor` + `FrameSourceFactory`, reconnexion avec attente exponentielle |
@@ -51,9 +57,12 @@ src/
 ├── banner.rs            # Banner : texte de la bannière de démarrage (dégradé du logo), affiché par main
 ├── domain/              # CŒUR — types et ports, aucune dépendance technique
 │   ├── mod.rs
-│   ├── frame.rs         # Frame, Resolution, Fps, SequenceNumber, PixelFormat, ParseResolutionError
-│   ├── device.rs        # DevicePath, CaptureSettings, SourceKind, FormatPreference
-│   └── source.rs        # ports FrameSource, FrameSourceFactory ; CaptureError, Recovery, SourceDescription
+│   ├── frame.rs         # Frame, Resolution, Fps, SequenceNumber, PixelFormat, BayerPattern,
+│   │                    # JpegQuality, ParseResolutionError
+│   ├── device.rs        # DevicePath, CaptureSettings, SourceKind, FormatPreference,
+│   │                    # EncodingSettings, WhiteBalance
+│   └── source.rs        # ports FrameSource, FrameSourceFactory ; CaptureError, Recovery,
+│                        # SourceDescription, FrameEncoding
 ├── stream/              # CŒUR — distribution des trames et supervision
 │   ├── mod.rs
 │   ├── hub.rs           # FrameHub, FrameSubscriber, DemandReceiver, HubCapacity
@@ -64,10 +73,21 @@ src/
 │   ├── mod.rs
 │   ├── factory.rs       # SourceFactory (Factory)
 │   ├── jpeg.rs          # complete_jpeg_len : vérification SOI/EOI, retrait du bourrage
-│   ├── synthetic.rs     # SyntheticSource (mire JPEG embarquée, assets/synthetic/)
+│   ├── negotiation.rs   # port CapabilityQuery, CapabilityTable, FourCc, SizeRange,
+│   │                    # IntervalRange, choose_format/resolution/fps, negotiate (ADR 0008)
+│   ├── convert/         # conversion des tampons en JPEG (ADR 0008)
+│   │   ├── mod.rs       # port FrameEncoder (Strategy), JpegPassthrough, RawJpegEncoder
+│   │   │                # (Pipeline), RawLayout, RawFormat, encoder_for (Factory)
+│   │   ├── bayer.rs     # demosaic_bilinear (4 motifs, bords par réflexion), mosaic,
+│   │   │                # BayerColor et color_at (géométrie des photosites)
+│   │   ├── yuyv.rs      # yuyv_to_rgb (BT.601 entier), rgb_to_yuyv
+│   │   └── white_balance.rs # GrayWorld (balance des blancs « monde gris », Bayer)
+│   ├── synthetic.rs     # SyntheticSource (mire JPEG embarquée, assets/synthetic/), Pacer
+│   ├── synthetic_raw.rs # SyntheticRawSource (mire GRBG ou YUYV convertie en JPEG)
 │   └── v4l2/            # feature Cargo « v4l2 » (par défaut)
 │       ├── mod.rs       # open_source(settings)
-│       ├── device.rs    # V4l2Device<S> (Typestate) : Opened -> Configured -> V4l2Source
+│       ├── device.rs    # V4l2Device<S> (Typestate) : Opened -> Configured -> V4l2Source ;
+│       │                # DeviceCapabilities (impl CapabilityQuery, ioctl ENUM_*)
 │       ├── source.rs    # V4l2Source : impl FrameSource (Adapter, RAII)
 │       ├── errno.rs     # map_open_error, map_io_error (traduction des errno)
 │       ├── guard.rs     # guarded() : appels v4l sous catch_unwind -> DriverFault
@@ -86,7 +106,8 @@ src/
 │   └── camstream.css    # style de la page (charte du logo)
 └── config/              # lecture et validation de la configuration
     ├── mod.rs           # Command (Serve / Healthcheck), AppConfig, HealthcheckConfig, ConfigError
-    └── cli.rs           # Cli (clap derive + env), enums miroirs SourceArg / FormatArg
+    └── cli.rs           # Cli (clap derive + env), enums miroirs SourceArg / FormatArg /
+                         # WhiteBalanceArg
 
 tests/
 ├── support/mod.rs       # ScriptedFactory / ScriptedSource, TestApp, client HTTP, MultipartReader
@@ -95,12 +116,15 @@ tests/
 ├── lifecycle.rs         # codes de sortie : arrêt, erreur fatale, panique, lecture bloquée
 ├── security.rs          # en-têtes de sécurité sur toutes les réponses, page compatible CSP
 ├── healthcheck.rs       # binaire `camstream healthcheck` : sain 0, failed 1, absent 1
+├── raw_formats.rs       # bout en bout GRBG 324x240 et YUYV : négociation, JPEG décodable, /health
 └── slow_client.rs       # client qui ne lit plus : trames sautées, capture non bloquée
 
 assets/synthetic/        # 10 images JPEG 640x480 de la mire (scripts/generate_synthetic_frames.py)
 ```
 
-Le repli YUYV (`encoder.rs`, feature `yuyv`) prévu en phase 2 n'existe pas encore.
+La conversion des formats bruts (`capture/convert/`) remplace le repli YUYV « phase 2 »
+(`encoder.rs`, feature `yuyv`) de la conception initiale : elle est toujours compilée et
+couvre aussi le Bayer 8 bits ([ADR 0008](adr/0008-formats-bruts-et-conversion-jpeg.md)).
 
 ### Graphe de dépendances entre modules
 
@@ -138,7 +162,13 @@ flowchart TB
 |---|---|---|
 | `FrameSource` | Fournir la prochaine trame JPEG (appel bloquant) | `V4l2Source`, `SyntheticSource`, sources de test (`ScriptedSource` dans `tests/`) |
 | `FrameSourceFactory` | (Re)créer une source ; utilisé à chaque reconnexion | `SourceFactory` (choix V4L2 / synthétique), fabriques de test |
+| *(interne à `capture`)* `CapabilityQuery` | Énumérer formats, tailles, cadences pour la négociation | `DeviceCapabilities` (ioctl V4L2), `CapabilityTable` (tests, mire brute) |
+| *(interne à `capture`)* `FrameEncoder` | Transformer un tampon de capture en JPEG | `JpegPassthrough` (MJPEG), `RawJpegEncoder` (YUYV, Bayer) |
 | *(côté entrant)* `FrameHub` / `FrameSubscriber` | API du cœur consommée par les transports | `server::mjpeg` aujourd'hui ; WebSocket/WebRTC demain |
+
+`CapabilityQuery` et `FrameEncoder` sont des ports **internes aux adaptateurs de source** :
+ils ne sont pas dans `domain` car le cœur ne voit jamais de trame brute ni de capacité de
+périphérique ; seul le résultat (trames JPEG, `SourceDescription`) traverse la frontière.
 
 `FrameHub` n'est volontairement **pas** un trait : c'est le cœur lui-même. Les transports en
 dépendent directement (sens autorisé adaptateur → cœur) et les tests utilisent un vrai
@@ -154,6 +184,7 @@ flowchart LR
             subgraph CaptureThread["Thread OS camstream-capture"]
                 Sup["CaptureSupervisor"]
                 Src["V4l2Source<br/>(impl FrameSource)"]
+                Enc["FrameEncoder<br/>(conversion JPEG si brut)"]
             end
             subgraph Runtime["Runtime tokio"]
                 Hub[("FrameHub<br/>broadcast borné")]
@@ -169,6 +200,7 @@ flowchart LR
     end
     Cam -->|"mmap V4L2"| Src
     Sup -->|"next_frame()"| Src
+    Src -->|"tampon mmap emprunté"| Enc
     Sup -->|"publish(Frame)"| Hub
     Sup -->|"send_replace(status)"| Status
     Hub -->|"subscribe et drop"| Demand
@@ -248,14 +280,34 @@ impl SequenceNumber {
     pub fn next(self) -> Self;
 }
 
+/// Disposition 2x2 des filtres d'un capteur Bayer (`BA81` = BGGR, `GBRG`, `GRBG`, `RGGB`).
+///
+/// Vocabulaire seulement : la géométrie des photosites (`BayerColor`, `color_at`) est
+/// un détail de l'algorithme et vit dans `capture::convert::bayer` ; l'ordre de
+/// préférence des motifs (`BAYER_PREFERENCE`) dans `capture::negotiation`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BayerPattern { Bggr, Gbrg, Grbg, Rggb }
+
 /// Format de pixels négocié avec le périphérique.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PixelFormat {
     /// Images JPEG compressées par la webcam (format privilégié, sans ré-encodage).
     Mjpeg,
-    /// Format brut YUV 4:2:2 (repli, nécessite un encodage JPEG logiciel).
+    /// YUV 4:2:2 entrelacé, converti puis encodé en JPEG par logiciel (ADR 0008).
     Yuyv,
+    /// Mosaïque Bayer 8 bits, débayerisée puis encodée en JPEG par logiciel (ADR 0008).
+    Bayer8(BayerPattern),
 }
+
+impl PixelFormat {
+    /// `MJPEG`, `YUYV`, `BA81`, `GBRG`, `GRBG`, `RGGB` (logs, `/health`).
+    pub fn as_str(self) -> &'static str;
+    /// Vrai pour MJPEG (aucun encodage logiciel).
+    pub fn is_compressed(self) -> bool;
+}
+
+/// Qualité JPEG de l'encodage logiciel, 1 à 100 (**Newtype**) ; `DEFAULT` = 80.
+pub struct JpegQuality(u8);
 
 /// Trame vidéo **encodée en JPEG**, prête à être diffusée.
 ///
@@ -270,8 +322,13 @@ pub struct Frame {
 }
 
 impl Frame {
-    /// Construit une trame à partir de données JPEG déjà encodées.
+    /// Construit une trame à partir de données JPEG déjà encodées (instant de capture :
+    /// maintenant).
     pub fn new(data: Bytes, resolution: Resolution, sequence: SequenceNumber) -> Self;
+    /// Variante avec l'instant de capture explicite : pris au retrait du tampon du
+    /// pilote, **avant** la conversion logicielle (la latence inclut l'encodage).
+    pub fn captured(data: Bytes, resolution: Resolution, sequence: SequenceNumber,
+                    captured_at: Instant) -> Self;
     /// Données JPEG (partagées, sans copie).
     pub fn data(&self) -> &Bytes;
     /// Résolution de l'image.
@@ -304,17 +361,27 @@ pub enum SourceKind {
     Synthetic,
 }
 
-/// Préférence de format de pixels demandée par la configuration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Préférence de format de pixels demandée par la configuration (`CAMSTREAM_FORMAT`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum FormatPreference {
-    /// MJPEG si disponible, sinon YUYV (comportement par défaut). En v1, sans
-    /// repli YUYV, équivaut à `Mjpeg`.
+    /// MJPEG natif si proposé, sinon YUYV, sinon Bayer 8 bits (défaut).
     #[default]
     Auto,
-    /// MJPEG exigé : erreur si la webcam ne le propose pas.
+    /// MJPEG exigé : erreur fatale si la webcam ne le propose pas.
     Mjpeg,
-    /// YUYV forcé (diagnostic ; coûteux en CPU). Phase 2 : refusé en v1.
+    /// YUYV exigé (conversion logicielle, coûteuse en CPU).
     Yuyv,
+    /// Bayer 8 bits exigé (premier de BA81, GBRG, GRBG, RGGB proposé).
+    Bayer,
+}
+
+/// Balance des blancs des formats Bayer : `GrayWorld` (défaut) ou `Off`.
+pub enum WhiteBalance { GrayWorld, Off }
+
+/// Encodage JPEG logiciel des formats bruts (ignoré en MJPEG natif).
+pub struct EncodingSettings {
+    pub quality: JpegQuality,          // CAMSTREAM_JPEG_QUALITY, défaut 80
+    pub white_balance: WhiteBalance,   // CAMSTREAM_WHITE_BALANCE, défaut gray-world
 }
 
 /// Paramètres complets nécessaires pour créer une source.
@@ -333,6 +400,8 @@ pub struct CaptureSettings {
     pub fps: Fps,
     /// Format de pixels souhaité.
     pub format: FormatPreference,
+    /// Encodage JPEG logiciel des formats bruts.
+    pub encoding: EncodingSettings,
     /// Délai maximal d'attente d'une trame avant `CaptureError::Timeout`.
     pub read_timeout: Duration,
 }
@@ -389,9 +458,14 @@ pub enum CaptureError {
     /// métadonnées `/dev/video1` d'une webcam UVC).
     #[error("not a streaming video capture device: {0}")]
     NotACaptureDevice(DevicePath),
-    /// Aucun format compatible avec la préférence demandée.
-    #[error("no supported pixel format for preference {preference:?}")]
-    UnsupportedFormat { preference: FormatPreference },
+    /// Aucun format proposé ne correspond à la préférence ; `offered` liste l'offre
+    /// de la caméra (« GRBG 162x120, 324x240 ») pour un diagnostic explicite.
+    #[error("no pixel format matching preference {preference}; the camera offers: {offered}")]
+    UnsupportedFormat { preference: FormatPreference, offered: String },
+    /// Résolution négociée inutilisable par la conversion (Bayer < 2x2, côté > 65 535,
+    /// plus de 4096x4096 pixels).
+    #[error("resolution {resolution} cannot be converted to JPEG: {reason}")]
+    UnsupportedResolution { resolution: Resolution, reason: &'static str },
     /// Type de source non compilé dans ce binaire (feature `v4l2` absente).
     #[error("source kind {0} is not available in this build")]
     SourceNotAvailable(SourceKind),
@@ -438,13 +512,25 @@ impl CaptureError {
 pub struct SourceDescription {
     /// Nom lisible (ex. carte de la webcam, « synthetic »).
     pub name: String,
-    /// Format natif négocié.
+    /// Format natif négocié (avant conversion éventuelle).
     pub pixel_format: PixelFormat,
     /// Résolution effective.
     pub resolution: Resolution,
-    /// Cadence effective.
+    /// Cadence effective, ou seulement demandée selon `fps_origin`.
     pub fps: Fps,
+    /// `Confirmed` (retour de `S_PARM`, cadence propre de la mire) ou `Requested`
+    /// (pilote sans réglage de cadence : `S_PARM` en `ENOTTY`/`EINVAL`).
+    pub fps_origin: FpsOrigin,
+    /// Origine des JPEG diffusés.
+    pub encoding: FrameEncoding,
 }
+
+/// Cadence confirmée par la source ou seulement demandée (jamais présentée comme
+/// négociée dans `/health` si le pilote ne l'a pas confirmée).
+pub enum FpsOrigin { Confirmed, Requested }
+
+/// `Native` (MJPEG relayé) ou `Software { quality }` (encodé sur le Pi).
+pub enum FrameEncoding { Native, Software { quality: JpegQuality } }
 ```
 
 Remarques d'implémentation :
@@ -454,7 +540,8 @@ Remarques d'implémentation :
 - `#[from] std::io::Error` a été retiré de `Io` : l'adaptateur V4L2 convertit explicitement
   (`capture::v4l2::errno::map_open_error` à l'ouverture, `map_io_error` ensuite), pour que
   `ENODEV` devienne `Disconnected`, `EACCES`/`EPERM` `PermissionDenied`, etc.
-- `SourceDescription` implémente `Display` (« Cam (MJPEG 640x480 @ 15 fps) ») pour les logs.
+- `SourceDescription` implémente `Display` (« Cam (MJPEG 640x480 @ 15 fps) », ou
+  « Cam (GRBG 324x240 @ 15 fps, software JPEG q80) ») pour les logs.
 
 ### 3.4 `stream` — diffuseur, état et superviseur
 
@@ -769,9 +856,81 @@ impl FrameSourceFactory for SourceFactory {
 ///
 /// Aucun encodage à l'exécution (images pré-encodées via `include_bytes!`) :
 /// utilisable sur le Pi pour valider le déploiement sans webcam, et en CI.
-pub struct SyntheticSource { /* images, cadence, séquence */ }
+/// Choisie en `CAMSTREAM_FORMAT=auto` ou `mjpeg`.
+pub struct SyntheticSource { /* images, cadence (Pacer), séquence */ }
 
 impl FrameSource for SyntheticSource { /* ... */ }
+
+/// Mire brute (Bayer GRBG ou YUYV) négociée sur une table de capacités simulée
+/// (en Bayer : celle de la caméra de l'utilisateur) puis convertie par la même chaîne
+/// que la webcam. Choisie en `CAMSTREAM_FORMAT=bayer` ou `yuyv`.
+pub struct SyntheticRawSource { /* tampons scène/brut réutilisés, Box<dyn FrameEncoder> */ }
+
+impl SyntheticRawSource {
+    pub fn open(settings: &CaptureSettings) -> Result<Self, CaptureError>;
+}
+```
+
+```rust
+//! Négociation format / résolution / cadence sur les capacités énumérées (ADR 0008).
+
+/// Code FourCC V4L2 (**Newtype**) ; `pixel_format()` : `MJPG`/`JPEG` → Mjpeg, `YUYV`,
+/// `BA81`/`GBRG`/`GRBG`/`RGGB` → Bayer8, autres → None (« unsupported »).
+pub struct FourCc([u8; 4]);
+
+/// Tailles proposées : `Discrete(Resolution)` ou `Stepwise { min, max, step_width, step_height }`.
+pub enum SizeRange { /* ... */ }
+/// Cadences proposées : `Discrete(FrameInterval)` ou `Stepwise { min, max }`.
+pub enum IntervalRange { /* ... */ }
+
+/// Port d'énumération (**Strategy** ; **Adapter** côté V4L2).
+pub trait CapabilityQuery {
+    fn formats(&self) -> Result<Vec<FourCc>, CaptureError>;
+    fn sizes(&self, fourcc: FourCc) -> Result<Vec<SizeRange>, CaptureError>;
+    fn intervals(&self, fourcc: FourCc, size: Resolution)
+        -> Result<Vec<IntervalRange>, CaptureError>;
+}
+
+/// Table en mémoire (tests, mire brute) ; `grbg_camera()` = caméra de l'utilisateur.
+pub struct CapabilityTable { /* ... */ }
+
+/// MJPEG, puis YUYV, puis BA81, GBRG, GRBG, RGGB (selon la préférence).
+pub fn choose_format(offered: &[PixelFormat], preference: FormatPreference) -> Option<PixelFormat>;
+/// Plus grande surface tenant dans la demande, sinon plus petite au-dessus.
+pub fn choose_resolution(sizes: &[SizeRange], requested: Resolution) -> Option<Resolution>;
+/// Cadence la plus proche, la plus basse en cas d'égalité.
+pub fn choose_fps(intervals: &[IntervalRange], requested: Fps) -> Option<Fps>;
+
+/// Énumère, journalise l'offre et le choix (`info`), renvoie le format à appliquer ;
+/// `UnsupportedFormat { preference, offered }` si rien ne convient.
+pub fn negotiate(query: &dyn CapabilityQuery, settings: &CaptureSettings)
+    -> Result<Negotiated, CaptureError>;   // { fourcc, pixel_format, resolution, fps }
+```
+
+```rust
+//! Transformation d'un tampon de capture en JPEG (ADR 0008).
+
+/// Port interne (**Strategy**) appliqué par les sources dans `next_frame`.
+pub trait FrameEncoder: Send {
+    /// Trame tronquée ou invalide : `CaptureError::CorruptedFrame` (Skip).
+    fn encode(&mut self, payload: &[u8]) -> Result<Bytes, CaptureError>;
+    fn encoding(&self) -> FrameEncoding;
+}
+
+/// MJPEG : vérification SOI/EOI, bourrage retiré, copie dans un `Bytes`.
+pub struct JpegPassthrough;
+
+/// Géométrie validée d'une trame brute : format, dimensions, pas de ligne
+/// (`bytesperline`, ou minimal) ; `min_payload()` = stride × (h − 1) + octets d'une ligne.
+pub struct RawLayout { /* ... */ }
+
+/// **Pipeline** brut → RGB (débayerisation bilinéaire ou YUYV) → balance des blancs
+/// (Bayer) → `jpeg-encoder` ; tampon RGB réutilisé.
+pub struct RawJpegEncoder { /* layout, qualité, GrayWorld, rgb: Vec<u8>, capacity_hint */ }
+
+/// **Factory** : `JpegPassthrough` pour MJPEG, `RawJpegEncoder` sinon.
+pub fn encoder_for(format: PixelFormat, resolution: Resolution, stride: Option<u32>,
+    settings: EncodingSettings) -> Result<Box<dyn FrameEncoder>, CaptureError>;
 ```
 
 ```rust
@@ -780,9 +939,10 @@ impl FrameSource for SyntheticSource { /* ... */ }
 /// États du périphérique (**Typestate**) : un périphérique ne peut démarrer le
 /// streaming qu'après avoir été configuré, vérifié à la compilation.
 pub struct Opened;
-/// Périphérique configuré avec un format négocié.
+/// Périphérique configuré avec un format négocié et sa stratégie de conversion.
 pub struct Configured {
-    negotiated: NegotiatedFormat,
+    negotiated: NegotiatedFormat,          // format, résolution, cadence appliqués
+    encoder: Box<dyn FrameEncoder>,
 }
 
 /// Périphérique V4L2 dans l'état `S`.
@@ -800,8 +960,9 @@ impl V4l2Device<Opened> {
     /// typées ; vérifie `VIDEO_CAPTURE | STREAMING` (sinon `NotACaptureDevice`, fatale).
     pub fn open(path: &DevicePath) -> Result<Self, CaptureError>;
 
-    /// Négocie format, résolution et cadence (MJPEG prioritaire, YUYV en repli
-    /// selon `FormatPreference`).
+    /// Négocie sur les capacités énumérées (`DeviceCapabilities` + `negotiate`),
+    /// applique `S_FMT` puis `S_PARM` (`ENOTTY` ou `EINVAL` tolérés), puis `encoder_for` avec le
+    /// `bytesperline` du pilote.
     pub fn configure(self, settings: &CaptureSettings)
         -> Result<V4l2Device<Configured>, CaptureError>;
 }
@@ -818,8 +979,13 @@ pub struct V4l2Source {
     _device: Released<v4l::Device>,
     path: DevicePath,
     description: SourceDescription,
+    encoder: Box<dyn FrameEncoder>,
     sequence: SequenceNumber,
 }
+
+/// Adaptateur `CapabilityQuery` sur les ioctl `VIDIOC_ENUM_FMT`, `ENUM_FRAMESIZES`,
+/// `ENUM_FRAMEINTERVALS` (sous `guarded` : `v4l` panique sur une description non UTF-8).
+pub struct DeviceCapabilities<'a> { device: &'a v4l::Device, path: &'a DevicePath }
 
 /// Ressource `v4l` détruite sous `catch_unwind` (**RAII**) : une panique d'un `Drop` de
 /// `v4l` est journalisée au lieu d'arrêter le thread de capture.
@@ -834,8 +1000,9 @@ pub(crate) fn guarded<T>(operation: &'static str,
 pub fn open_source(settings: &CaptureSettings) -> Result<V4l2Source, CaptureError>;
 
 impl FrameSource for V4l2Source {
-    /// Copie le tampon mmap dans un `Bytes` (seule copie de la chaîne) puis le rend
-    /// au pilote ; encode en JPEG uniquement si le format négocié est YUYV.
+    /// Tronque le tampon mmap à `bytesused` et le confie à l'encodeur **sans copie de
+    /// l'image brute** : MJPEG copié dans un `Bytes` (seule copie de la chaîne), formats
+    /// bruts convertis puis encodés en JPEG, dans le thread de capture.
     fn next_frame(&mut self) -> Result<Frame, CaptureError>;
     fn description(&self) -> SourceDescription;
 }
@@ -995,10 +1162,15 @@ pub struct CameraReport {
     pub error: Option<String>,
 }
 
-/// DTO de `SourceDescription` (nom, format, `"640x480"`, cadence).
+/// DTO de `SourceDescription` (nom, format natif, `"640x480"`, cadence, encodage).
 #[derive(Debug, serde::Serialize)]
-pub struct SourceReport { pub name: String, pub pixel_format: &'static str,
-                          pub resolution: String, pub fps: u32 }
+pub struct SourceReport { pub name: String,
+                          pub pixel_format: &'static str,   // MJPEG, YUYV, BA81, GBRG, GRBG, RGGB
+                          pub resolution: String, pub fps: u32,
+                          pub fps_origin: &'static str,     // "confirmed" ou "requested"
+                          pub encoding: &'static str,       // "native" ou "software"
+                          #[serde(skip_serializing_if = "Option::is_none")]
+                          pub jpeg_quality: Option<u8> }    // en "software"
 
 /// Correspondance explicite cœur → JSON : renommer une variante du cœur ne change
 /// pas le contrat JSON sans modification visible ici.
@@ -1183,12 +1355,15 @@ pub enum ConfigError {
 (`SourceArg`, `FormatArg`, `clap::ValueEnum`) convertis par `From` ; `Resolution` est analysée
 par son `FromStr`. Les commentaires `///` des options sont en français (règle du projet) et
 le texte d'aide, technique, est donné en anglais par l'attribut `help`. Validation
-(`ConfigError::Invalid`, code de sortie 2) : `--format yuyv` refusé en v1, délai de lecture
+(`ConfigError::Invalid`, code de sortie 2) : délai de lecture
 supérieur à l'intervalle entre images **et strictement inférieur au délai d'arrêt**
 (`--read-timeout-ms` < `--shutdown-timeout-ms`, § 5.4), `--hub-capacity` ≤ 64,
 `--max-clients` ≤ 1000, `--reconnect-max-ms` ≥ `--reconnect-initial-ms`.
 `--max-corrupted-frames` (`CAMSTREAM_MAX_CORRUPTED_FRAMES`, défaut 30, ≥ 1) règle le seuil de
-trames invalides consécutives. À noter : `try_parse_from` lit quand même les variables
+trames invalides consécutives. `--format` accepte `auto`, `mjpeg`, `yuyv`, `bayer` ;
+`--jpeg-quality` (`CAMSTREAM_JPEG_QUALITY`, 1 à 100, défaut 80) et `--white-balance`
+(`CAMSTREAM_WHITE_BALANCE`, `gray-world` ou `off`) forment `CaptureSettings::encoding`
+(ADR 0008). À noter : `try_parse_from` lit quand même les variables
 `CAMSTREAM_*` du processus (feature `env`) ; les tests de configuration vérifient qu'aucune
 n'est définie. C'est
 `app` qui convertit `AppConfig` en `HubCapacity`, `SupervisorSettings`, `MaxClients`.
@@ -1328,6 +1503,42 @@ classDiagram
     class V4l2Device~S~ {
         -device v4l_Device
         -state S
+        +configure(settings) V4l2Device~Configured~
+    }
+    class SyntheticRawSource {
+        -encoder BoxFrameEncoder
+        +open(settings) Result
+        +next_frame() Result~Frame~
+    }
+    class CapabilityQuery {
+        <<interface>>
+        +formats() Result~VecFourCc~
+        +sizes(fourcc) Result~VecSizeRange~
+        +intervals(fourcc, size) Result~VecIntervalRange~
+    }
+    class DeviceCapabilities {
+        -device v4l_Device
+    }
+    class CapabilityTable {
+        +grbg_camera() CapabilityTable
+    }
+    class Negotiation {
+        <<module>>
+        +negotiate(query, settings) Result~Negotiated~
+        +choose_format()
+        +choose_resolution()
+        +choose_fps()
+    }
+    class FrameEncoder {
+        <<interface>>
+        +encode(payload) Result~Bytes~
+        +encoding() FrameEncoding
+    }
+    class JpegPassthrough
+    class RawJpegEncoder {
+        -layout RawLayout
+        -rgb Vec_u8
+        -balance Option~GrayWorld~
     }
     class Server {
         +router() Router
@@ -1374,6 +1585,17 @@ classDiagram
 
     FrameSource <|.. V4l2Source : implémente
     FrameSource <|.. SyntheticSource : implémente
+    FrameSource <|.. SyntheticRawSource : implémente
+    CapabilityQuery <|.. DeviceCapabilities : implémente
+    CapabilityQuery <|.. CapabilityTable : implémente
+    FrameEncoder <|.. JpegPassthrough : implémente
+    FrameEncoder <|.. RawJpegEncoder : implémente
+    V4l2Device ..> Negotiation : configure
+    Negotiation ..> CapabilityQuery : interroge
+    V4l2Source o-- FrameEncoder : applique
+    SyntheticRawSource o-- FrameEncoder : applique
+    SyntheticRawSource ..> CapabilityTable : négocie
+    SourceFactory ..> SyntheticRawSource : crée
     FrameSourceFactory <|.. SourceFactory : implémente
     SourceFactory ..> V4l2Device : crée
     V4l2Device ..> V4l2Source : start_streaming
@@ -1417,7 +1639,28 @@ flowchart LR
 ```
 
 La seule copie de l'image a lieu à la sortie du tampon mmap (qui doit être rendu au pilote
-pour être réutilisé). En repli YUYV, cette étape est remplacée par l'encodage JPEG.
+pour être réutilisé). Avec un format brut, cette copie est remplacée par la conversion : le
+tampon mmap est **lu sur place** puis encodé, et le JPEG produit devient le `Bytes` de la
+trame sans copie supplémentaire.
+
+```mermaid
+flowchart LR
+    K["Tampon mmap du pilote<br/>GRBG 324x240<br/>(lu sur place)"] -->|"bytesused vérifié<br/>sinon CorruptedFrame"| D["Débayerisation bilinéaire<br/>vers tampon RGB réutilisé"]
+    Y["Tampon mmap YUYV"] -->|"bytesused vérifié"| C["YUYV vers RGB<br/>BT.601 entier"]
+    C --> E
+    D --> W["Balance des blancs<br/>monde gris (Bayer)"]
+    W --> E["jpeg-encoder<br/>qualité CAMSTREAM_JPEG_QUALITY"]
+    E -->|"Vec du JPEG, 0 copie"| F["Frame<br/>(Bytes partagé)"]
+    F --> H[("FrameHub")]
+    subgraph Thread["Thread camstream-capture (jamais le runtime tokio)"]
+        K
+        Y
+        D
+        C
+        W
+        E
+    end
+```
 
 ### 5.2 Démarrage
 
@@ -1590,6 +1833,43 @@ pendant lesquelles la connexion est ouverte mais sans image ; la page HTML affic
 « Démarrage de la caméra… » jusqu'au premier `onload` de l'image. Les spectateurs suivants,
 et les rechargements dans le délai de grâce, ne subissent pas cette latence.
 
+### 5.6 Ouverture et négociation du format (ADR 0008)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant F as SourceFactory
+    participant D as V4l2Device
+    participant Q as DeviceCapabilities
+    participant N as negotiate()
+    participant P as Pilote V4L2
+    participant E as encoder_for()
+    F->>D: open(path) puis configure(settings)
+    D->>N: negotiate(&DeviceCapabilities, settings)
+    N->>Q: formats()
+    Q->>P: VIDIOC_ENUM_FMT
+    P-->>Q: GRBG
+    N->>Q: sizes(GRBG)
+    Q->>P: VIDIOC_ENUM_FRAMESIZES
+    P-->>Q: 162x120, 324x240
+    N->>N: log info camera formats detected
+    N->>N: choose_format auto donne GRBG, choose_resolution 640x480 donne 324x240
+    N->>Q: intervals(GRBG, 324x240)
+    Q->>P: VIDIOC_ENUM_FRAMEINTERVALS
+    P-->>Q: erreur, non pris en charge
+    N->>N: cadence demandée 15 conservée, log info capture format selected
+    alt aucun format ne correspond, par exemple CAMSTREAM_FORMAT=mjpeg
+        N-->>D: UnsupportedFormat avec l'offre, fatale
+    end
+    N-->>D: Negotiated GRBG 324x240 15 fps
+    D->>P: VIDIOC_S_FMT GRBG 324x240
+    P-->>D: format appliqué, bytesperline
+    D->>P: VIDIOC_S_PARM 15 fps, ENOTTY ou EINVAL tolérés
+    D->>E: encoder_for(GRBG, 324x240, stride, encoding)
+    E-->>D: RawJpegEncoder
+    D-->>F: start_streaming donne V4l2Source avec l'encodeur
+```
+
 ## 6. Gestion des erreurs
 
 | Couche | Type | Traitement |
@@ -1605,12 +1885,12 @@ Politique de reprise de la capture :
 
 | `CaptureError` | `Recovery` | Comportement |
 |---|---|---|
-| `CorruptedFrame` (pas de `SOI`/`EOI`, tampon vide, drapeau `V4L2_BUF_FLAG_ERROR`) | `Skip` | Trame jetée, log `debug` ; au-delà de `max_corrupted_frames` trames invalides **consécutives** (défaut 30), le superviseur produit `CorruptedStream` |
+| `CorruptedFrame` (pas de `SOI`/`EOI`, tampon vide, drapeau `V4L2_BUF_FLAG_ERROR`, trame brute plus courte que la taille attendue) | `Skip` | Trame jetée, log `debug` ; au-delà de `max_corrupted_frames` trames invalides **consécutives** (défaut 30), le superviseur produit `CorruptedStream` |
 | `CorruptedStream` | `Reopen` | Source rouverte comme après une déconnexion (§ 7.2) |
 | `DriverFault` (panique de `v4l` interceptée) | `Reopen` | Source abandonnée puis recréée avec attente exponentielle (§ 7.2) |
 | `Timeout` | `Reopen` | Webcam figée : la source est détruite puis recréée (choix lié au comportement de `v4l` 0.14, § 3.5) |
-| `Disconnected`, `DeviceNotFound`, `Io` (dont `EINVAL`, `EBUSY`) | `Reopen` | Statut `Reconnecting`, attente exponentielle (1 s, 2 s, 4 s… max 30 s), nouvel appel à la fabrique — **uniquement tant qu'il y a des abonnés** ; sinon `Idle` |
-| `PermissionDenied`, `NotACaptureDevice`, `UnsupportedFormat` (dont « pas de MJPEG » en v1), `SourceNotAvailable` | `Fatal` | Statut `Failed`, fin du thread de capture avec l'erreur ; `main` l'observe (statut `watch` ou fin du thread) et annule le jeton racine, sortie code 1 (la politique `restart` de Docker prend le relais) |
+| `Disconnected`, `DeviceNotFound`, `Io` (dont `EINVAL`, `EBUSY`, et aucun format énuméré) | `Reopen` | Statut `Reconnecting`, attente exponentielle (1 s, 2 s, 4 s… max 30 s), nouvel appel à la fabrique — **uniquement tant qu'il y a des abonnés** ; sinon `Idle` |
+| `PermissionDenied`, `NotACaptureDevice`, `UnsupportedFormat` (`CAMSTREAM_FORMAT` impossible, message listant l'offre de la caméra), `UnsupportedResolution` (taille inconvertible), `SourceNotAvailable` | `Fatal` | Statut `Failed`, fin du thread de capture avec l'erreur ; `main` l'observe (statut `watch` ou fin du thread) et annule le jeton racine, sortie code 1 (la politique `restart` de Docker prend le relais) |
 
 Le superviseur reçoit un jeton **enfant** (§ 5.2) : annuler un `child_token()` n'annule pas
 son parent. Le superviseur ne peut donc pas déclencher lui-même l'arrêt global ; c'est `main`
@@ -1762,14 +2042,17 @@ conteneur après rebranchement (voir [deploiement.md](deploiement.md#7-reconnexi
 - Threads du runtime : `worker_threads` laissé au défaut (nombre de cœurs du Pi) ; à réduire à 2
   si les mesures montrent une contention avec la capture.
 
-### Format YUYV de repli
+### Formats bruts et conversion JPEG
 
-Si la webcam ne propose pas MJPEG, le navigateur ne peut pas afficher du YUYV : il faut encoder
-en JPEG sur le Pi. Cet encodage est confiné à `V4l2Source` (stratégie `JpegEncoder` interne,
-crate `jpeg-encoder`, qualité `CAMSTREAM_JPEG_QUALITY`) afin que le contrat « trames JPEG » du
-port reste vrai. Il est prévu en **phase 2** (feature `yuyv`) ; en phase 1, l'absence de MJPEG
-produit `UnsupportedFormat` (erreur fatale explicite). En YUYV, limiter la résolution (640x480)
-et la cadence (10 à 15 i/s).
+Si la webcam ne propose pas MJPEG, le navigateur ne peut afficher ni du YUYV ni du Bayer : la
+trame est encodée en JPEG sur le Pi ([ADR 0008](adr/0008-formats-bruts-et-conversion-jpeg.md)).
+L'encodage est confiné aux adaptateurs de source (stratégie `FrameEncoder`, crate
+`jpeg-encoder`, qualité `CAMSTREAM_JPEG_QUALITY`) afin que le contrat « trames JPEG » du port
+reste vrai, et s'exécute **dans le thread `camstream-capture`**, dans l'appel bloquant
+`next_frame` : le runtime tokio n'est jamais sollicité. Coût mesuré : 1,5 ms par trame
+`GRBG` 324x240 en natif x86_64 (estimation Pi 4 : 3 à 5 ms) ; la conversion se poursuit
+pendant le délai de grâce de la capture à la demande. En format brut, préférer des
+résolutions ≤ 640x480 et des cadences de 10 à 15 i/s.
 
 ## 9. Observabilité
 
@@ -1790,7 +2073,9 @@ et la cadence (10 à 15 i/s).
 | Plusieurs caméras | Un couple `CaptureSupervisor` + `FrameHub` par caméra, routes `/cameras/{id}/stream.mjpg` |
 | `/snapshot.jpg` | Nécessite de conserver la dernière trame (un `watch<Option<Frame>>` en plus du hub) |
 | Authentification / TLS | Hors v1 ([ADR 0007](adr/0007-securite-reseau-local-v1.md)) : reverse proxy en amont ou VPN, nouvel ADR |
-| Conversion YUYV → JPEG | Phase 2 (feature `yuyv`) ; en v1, webcam sans MJPEG = erreur fatale explicite |
+| Accélération de la conversion | NEON ou `turbojpeg` si les mesures sur le Pi l'exigent ([ADR 0008](adr/0008-formats-bruts-et-conversion-jpeg.md)) ; sauter la conversion pendant le délai de grâce sans abonné |
+| Dernier format négocié dans `/health` en `idle` | Aujourd'hui exposé seulement en `streaming` (et dans les logs) |
+| Correction d'image des capteurs bruts | Niveau de noir, gamma, Bayer 10/12 bits : non pris en charge |
 
 ## 11. Écarts entre la conception initiale et l'implémentation
 
@@ -1809,7 +2094,11 @@ et la cadence (10 à 15 i/s).
 | `TcpOptions` | 4 champs | + `nodelay` | `TCP_NODELAY` recommandé au § 3.6 |
 | `CameraReport` | `state`, `source`, `error` | + `attempt` (en `reconnecting`) | Diagnostic de la reconnexion |
 | Validation de la vidéo | Non précisée | `capture::jpeg::complete_jpeg_len` (`SOI`/`EOI`, bourrage) | Spike 0001 : bourrage et trames tronquées possibles |
-| `CAMSTREAM_JPEG_QUALITY` | Listée | Non implémentée | Repli YUYV en phase 2 |
+| `CAMSTREAM_JPEG_QUALITY` | Listée (repli YUYV, phase 2) | Implémentée (défaut 80), avec `CAMSTREAM_WHITE_BALANCE` | Caméra de l'utilisateur sans MJPEG (ADR 0008) |
+| Repli YUYV | Phase 2, feature `yuyv`, `encoder.rs` dans `V4l2Source` | `capture/convert/` toujours compilé : YUYV **et** Bayer 8 bits, port `FrameEncoder` partagé avec la mire brute | ADR 0008 |
+| Négociation du format | `S_FMT` MJPEG avec la demande, ajustée par le pilote | Énumération des formats, tailles et cadences, choix documenté (`capture::negotiation`), `S_PARM` en `ENOTTY` ou `EINVAL` toléré | ADR 0008 |
+| `UnsupportedFormat` | `{ preference }` | `{ preference, offered }` + `UnsupportedResolution` | Message de diagnostic listant l'offre de la caméra |
+| `SourceDescription` / `/health` | `pixel_format` MJPEG ou YUYV | + `encoding` (`native`/`software`), `jpeg_quality` ; formats Bayer | ADR 0008 |
 | Runtime `current_thread` | Mise en garde | Refusé par `App::bind` (erreur explicite) | `Handle::block_on` n'y ferait pas avancer les minuteries |
 | Paniques de `v4l` hors `Drop` | Non traitées | `guarded()` → `CaptureError::DriverFault` (`Reopen`) | Revue v1 (§ 7.2) |
 | Trames corrompues en continu | `Skip` sans limite | `CorruptedStream` (`Reopen`) après `max_corrupted_frames` consécutives (défaut 30, configurable) | Revue v1 (§ 7.2) |

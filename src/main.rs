@@ -71,6 +71,8 @@ fn serve(config: AppConfig) -> anyhow::Result<camstream::app::Outcome> {
         device = %config.capture.device,
         resolution = %config.capture.resolution,
         fps = %config.capture.fps,
+        format = %config.capture.format,
+        jpeg_quality = %config.capture.encoding.quality,
         bind = %config.bind,
         "starting camstream"
     );
