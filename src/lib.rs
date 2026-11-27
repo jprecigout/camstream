@@ -4,7 +4,8 @@
 //! Architecture hexagonale (ADR 0001) :
 //! - cœur : [`domain`] (types et ports) et [`stream`] (diffusion, supervision) ;
 //! - adaptateurs : [`capture`] (V4L2, mire synthétique) et [`server`] (HTTP) ;
-//! - [`config`] (CLI et environnement) et [`app`] (racine de composition).
+//! - [`config`] (CLI et environnement) et [`app`] (racine de composition) ;
+//! - [`banner`] : bannière de démarrage (texte seul, affiché par le binaire).
 //!
 //! La bibliothèque est exposée pour les tests d'intégration (`tests/`) ; le binaire
 //! `camstream` (`src/main.rs`) n'en est qu'un mince point d'entrée.
@@ -23,6 +24,7 @@ compile_error!(
 );
 
 pub mod app;
+pub mod banner;
 pub mod capture;
 pub mod config;
 pub mod domain;
