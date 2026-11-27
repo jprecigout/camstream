@@ -56,9 +56,9 @@ coût de cross-compilation à prendre en compte.
 | Options de socket TCP | `socket2` 0.6 | feature **`all`** (requise pour `set_tcp_user_timeout` et `TcpKeepalive::with_retries`) ; `SO_KEEPALIVE` et `TCP_USER_TIMEOUT` sur les connexions acceptées. Déjà tirée par `tokio` (feature `net`, qui active aussi `all`) : la déclarer en dépendance directe avec la même version majeure n'ajoute pas de crate au graphe |
 | Erreurs | `thiserror`, `anyhow` | `anyhow` uniquement dans `main.rs` / `app` |
 | Logs | `tracing`, `tracing-subscriber` | `fmt`, `env-filter` |
-| Encodage JPEG (repli YUYV, **phase 2**) | `jpeg-encoder` | 100 % Rust, optionnelle (feature `yuyv`) |
+| Encodage JPEG (formats bruts YUYV et Bayer) | `jpeg-encoder` 0.7 | 100 % Rust, sans dépendance ; toujours compilée (sans feature `simd`) depuis l'[ADR 0008](0008-formats-bruts-et-conversion-jpeg.md) |
 | Codes `errno` (adaptateur V4L2) | `libc` | optionnelle, activée par la feature `v4l2` ; déjà tirée par `v4l` |
-| Tests | `tower` (`util`), `http-body-util`, `hyper` (`client`, `http1`), `hyper-util` (`tokio`), `serde_json` | dev-dependencies uniquement ; toutes déjà dans le graphe via axum (le client HTTP/1.1 de hyper lit le flux multipart morceau par morceau) |
+| Tests | `tower` (`util`), `http-body-util`, `hyper` (`client`, `http1`), `hyper-util` (`tokio`), `serde_json`, `jpeg-decoder` | dev-dependencies uniquement ; toutes déjà dans le graphe via axum (le client HTTP/1.1 de hyper lit le flux multipart morceau par morceau), sauf `jpeg-decoder` (ADR 0008 : décodage des JPEG produits par le convertisseur) |
 
 Le choix de `v4l` est conditionné à un **spike de cross-compilation** (bindgen vers
 `aarch64-unknown-linux-gnu`) en tout début d'implémentation. En cas d'échec ou de coût
@@ -78,6 +78,16 @@ changement n'impacte que `src/capture/v4l2/`.
 > `v4l2-sys-mit` (1.85 suffirait sans la feature `v4l2`). Pas de feature `yuyv` ni de
 > `jpeg-encoder` en v1 (phase 2).
 
+> **Complément (formats bruts, 2026-11-27)** : `jpeg-encoder` **0.7.1** est adoptée pour
+> l'encodage des formats bruts (YUYV, Bayer) : MIT/Apache-2.0 **et IJG** (mention
+> d'attribution ajoutée au README), aucune dépendance, `forbid(unsafe_code)` sans la feature
+> `simd`, `rust-version` 1.87, dernière version du 2026-07-27. Elle n'est plus optionnelle
+> (pas de feature `yuyv`) : la source synthétique brute l'utilise aussi sans la feature
+> `v4l2`. Elle est compilée en `opt-level = 3` même en profil `dev`
+> (`[profile.dev.package.jpeg-encoder]`) pour garder les tests de bout en bout rapides.
+> `jpeg-decoder` 0.3 (MIT/Apache-2.0) est ajoutée en dépendance de test. Mesures et
+> justification : [ADR 0008](0008-formats-bruts-et-conversion-jpeg.md).
+
 ## Conséquences
 
 - L'étape de build Docker doit fournir `clang`/`libclang-dev` et les en-têtes noyau de la cible
@@ -90,6 +100,6 @@ changement n'impacte que `src/capture/v4l2/`.
   (`server::health::HealthReport`, construit par `From<&SourceStatus>`). Ainsi, renommer une
   variante interne ne casse pas le contrat JSON, et le cœur n'acquiert pas de dépendance de
   sérialisation pour un unique endpoint.
-- Encodage YUYV → JPEG : `jpeg-encoder` est retenu pour la simplicité de build ; si ses
-  performances sont insuffisantes sur Pi, `turbojpeg` (libjpeg-turbo, optimisé NEON) sera
-  réévalué par ADR.
+- Encodage des formats bruts → JPEG : `jpeg-encoder` est retenu pour la simplicité de build ;
+  si ses performances sont insuffisantes sur Pi, `turbojpeg` (libjpeg-turbo, optimisé NEON)
+  sera réévalué par ADR (estimations dans l'ADR 0008).

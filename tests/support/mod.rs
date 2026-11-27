@@ -16,8 +16,9 @@ use bytes::{Bytes, BytesMut};
 use camstream::app::{App, Outcome};
 use camstream::config::AppConfig;
 use camstream::domain::{
-    CaptureError, CaptureSettings, DevicePath, FormatPreference, Fps, Frame, FrameSource,
-    FrameSourceFactory, PixelFormat, Resolution, SequenceNumber, SourceDescription, SourceKind,
+    CaptureError, CaptureSettings, DevicePath, EncodingSettings, FormatPreference, Fps, FpsOrigin,
+    Frame, FrameEncoding, FrameSource, FrameSourceFactory, PixelFormat, Resolution, SequenceNumber,
+    SourceDescription, SourceKind,
 };
 use camstream::stream::{SourceStatus, StatusReceiver};
 use http_body_util::{BodyExt, Empty};
@@ -278,6 +279,8 @@ impl FrameSource for ScriptedSource {
             pixel_format: PixelFormat::Mjpeg,
             resolution: Resolution::new(1, 1).unwrap(),
             fps: Fps::new(100).unwrap(),
+            fps_origin: FpsOrigin::Confirmed,
+            encoding: FrameEncoding::Native,
         }
     }
 }
@@ -297,6 +300,7 @@ pub fn test_config() -> AppConfig {
             resolution: Resolution::new(640, 480).unwrap(),
             fps: Fps::new(50).unwrap(),
             format: FormatPreference::Auto,
+            encoding: EncodingSettings::default(),
             read_timeout: Duration::from_secs(1),
         },
         bind: "127.0.0.1:0".parse().unwrap(),

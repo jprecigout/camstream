@@ -1,6 +1,7 @@
 # Catalogue des design patterns
 
-> Statut : **v1 implémentée**. Les emplacements indiqués sont les fichiers et types **réels**
+> Statut : **v1 implémentée**, plus les formats bruts et la négociation
+> ([ADR 0008](adr/0008-formats-bruts-et-conversion-jpeg.md)). Les emplacements indiqués sont les fichiers et types **réels**
 > (voir [architecture.md](architecture.md#2-découpage-en-modules)). Conformément à `CLAUDE.md`,
 > chaque type concerné nomme son pattern dans son commentaire `///` (ex. « Implémente le
 > pattern **Strategy** ») ; ce catalogue est mis à jour dans le même commit que le code.
@@ -9,14 +10,15 @@
 
 | Pattern | Catégorie | Problème résolu | Où |
 |---|---|---|---|
-| [Strategy](#strategy) | Comportement | Remplacer la webcam par une autre source sans toucher au cœur | `src/domain/source.rs` — `FrameSource` ; `V4l2Source`, `SyntheticSource`, `ScriptedSource` (tests) |
+| [Strategy](#strategy) | Comportement | Remplacer la webcam par une autre source sans toucher au cœur ; choisir la conversion en JPEG et la source des capacités à l'exécution | `src/domain/source.rs` — `FrameSource` ; `V4l2Source`, `SyntheticSource`, `SyntheticRawSource`, `ScriptedSource` (tests) ; `src/capture/convert/mod.rs` — `FrameEncoder` ; `src/capture/negotiation.rs` — `CapabilityQuery` |
+| [Pipeline](#pipeline) | Comportement | Enchaîner conversion RGB, balance des blancs et encodage JPEG sur un tampon réutilisé | `src/capture/convert/mod.rs` — `RawJpegEncoder` |
 | [Observer / Publish-Subscribe](#observer--publish-subscribe) | Comportement | Livrer chaque trame à N clients sans que les lents bloquent ; réveiller la capture au premier client | `src/stream/hub.rs` — `FrameHub`, `FrameSubscriber`, `DemandReceiver` ; `src/stream/status.rs` — `SourceStatus` |
-| [Adapter](#adapter) | Structure | Isoler la crate `v4l` et axum derrière nos propres types | `src/capture/v4l2/` — `V4l2Device`, `V4l2Source` ; `src/server/` |
-| [Factory](#factory) | Création | Recréer une source après déconnexion sans connaître son type | `src/domain/source.rs` — `FrameSourceFactory` ; `src/capture/factory.rs` — `SourceFactory` ; `ScriptedFactory` (tests) |
+| [Adapter](#adapter) | Structure | Isoler la crate `v4l` et axum derrière nos propres types | `src/capture/v4l2/` — `V4l2Device`, `V4l2Source`, `DeviceCapabilities` ; `src/server/` |
+| [Factory](#factory) | Création | Recréer une source après déconnexion sans connaître son type ; choisir la stratégie de conversion selon le format négocié | `src/domain/source.rs` — `FrameSourceFactory` ; `src/capture/factory.rs` — `SourceFactory` ; `ScriptedFactory` (tests) ; `src/capture/convert/mod.rs` — `encoder_for` |
 | [Builder](#builder) | Création | Construire le serveur avec paramètres obligatoires et optionnels | `src/server/mod.rs` — `ServerBuilder` |
 | [Decorator](#decorator) | Structure | Ajouter les en-têtes de sécurité à **toutes** les réponses sans modifier chaque handler | `src/server/security.rs` — `add_security_headers` ; appliqué dans `src/server/routes.rs` (`map_response`) |
 | [DTO](#dto-data-transfer-object) | Structure | Contrat JSON de `/health` indépendant des types du cœur | `src/server/health.rs` — `HealthReport`, `CameraReport`, `SourceReport` |
-| [Newtype](#newtype) | Idiome Rust | Interdire les valeurs invalides ou confondues | `src/domain/frame.rs`, `src/domain/device.rs`, `src/stream/hub.rs`, `src/server/mjpeg.rs` |
+| [Newtype](#newtype) | Idiome Rust | Interdire les valeurs invalides ou confondues | `src/domain/frame.rs`, `src/domain/device.rs`, `src/stream/hub.rs`, `src/server/mjpeg.rs`, `src/capture/negotiation.rs`, `src/capture/convert/mod.rs` |
 | [RAII](#raii) | Idiome Rust | Libérer périphérique, tampons, abonnements, demande et places client sans oubli ; signaler une panique | `V4l2Source`, `Released<T>`, `FrameSubscriber`, `ClientSession`, `OwnedSemaphorePermit`, `PanicGuard` |
 | [Typestate](#typestate) | Idiome Rust | Garantir l'ordre ouvrir → configurer → streamer à la compilation | `src/capture/v4l2/device.rs` — `V4l2Device<S>` |
 
@@ -54,6 +56,79 @@ classDiagram
     FrameSource <|.. SyntheticSource
     FrameSource <|.. ScriptedSource
     CaptureSupervisor ..> FrameSource : utilise
+```
+
+### Stratégies internes aux adaptateurs de source (ADR 0008)
+
+- **`FrameEncoder`** (`src/capture/convert/mod.rs`) : transformation d'un tampon de capture
+  en JPEG. Stratégies `JpegPassthrough` (MJPEG natif : vérification et copie) et
+  `RawJpegEncoder` (YUYV, Bayer). `V4l2Source` (`src/capture/v4l2/source.rs`) et
+  `SyntheticRawSource` (`src/capture/synthetic_raw.rs`) l'appliquent dans `next_frame` sans
+  connaître le format. Placée dans `capture` et non dans `domain` : le cœur ne voit que des
+  trames JPEG, le port `FrameSource` garde son contrat.
+- **`CapabilityQuery`** (`src/capture/negotiation.rs`) : source des capacités pour la
+  négociation. `DeviceCapabilities` (ioctl V4L2, `src/capture/v4l2/device.rs`) et
+  `CapabilityTable` (table en mémoire : tests, mire brute imitant la caméra `GRBG` de
+  l'utilisateur). Les règles de choix (`choose_format`, `choose_resolution`, `choose_fps`)
+  sont ainsi testées sans matériel.
+- **Choix Rust** : `Box<dyn FrameEncoder>` (choisi à l'exécution selon le format négocié,
+  un appel dynamique par trame, négligeable) ; `&dyn CapabilityQuery` pour `negotiate`.
+
+```mermaid
+classDiagram
+    class FrameEncoder {
+        <<interface>>
+        +encode(payload) Result~Bytes~
+        +encoding() FrameEncoding
+    }
+    class JpegPassthrough
+    class RawJpegEncoder
+    class CapabilityQuery {
+        <<interface>>
+        +formats() Result
+        +sizes(fourcc) Result
+        +intervals(fourcc, size) Result
+    }
+    class DeviceCapabilities
+    class CapabilityTable
+    class V4l2Source
+    class SyntheticRawSource
+    FrameEncoder <|.. JpegPassthrough
+    FrameEncoder <|.. RawJpegEncoder
+    CapabilityQuery <|.. DeviceCapabilities
+    CapabilityQuery <|.. CapabilityTable
+    V4l2Source o-- FrameEncoder : applique
+    SyntheticRawSource o-- FrameEncoder : applique
+    SyntheticRawSource ..> CapabilityTable : négocie
+```
+
+## Pipeline
+
+- **Catégorie** : comportement (chaîne de traitement).
+- **Problème résolu** : une trame brute doit traverser plusieurs étapes indépendantes
+  (conversion en RGB selon le format, balance des blancs facultative, encodage JPEG) sans
+  copie intermédiaire ni allocation par trame, et chaque étape doit être testable seule.
+- **Où** : `RawJpegEncoder::encode` (`src/capture/convert/mod.rs`) enchaîne
+  `bayer::demosaic_bilinear` ou `yuyv::yuyv_to_rgb` (`src/capture/convert/bayer.rs`,
+  `yuyv.rs`), `GrayWorld::apply` (`src/capture/convert/white_balance.rs`, Bayer seulement) et
+  `jpeg_encoder::Encoder`. Les étapes partagent un **tampon RGB alloué une fois** ; l'entrée
+  est le tampon mmap emprunté (aucune copie de l'image brute), la sortie un `Vec` transféré
+  sans copie dans le `Bytes` de la trame. Une trame tronquée est rejetée avant la première
+  étape (`CorruptedFrame`).
+- **Choix Rust** : pipeline statique (fonctions appelées en séquence dans `encode`) plutôt
+  qu'une liste dynamique d'étapes `Vec<Box<dyn Stage>>` : trois étapes connues, sans besoin de
+  reconfiguration à l'exécution ; ajouter une étape (mise à l'échelle, horodatage) reste
+  local à `encode`.
+
+```mermaid
+flowchart LR
+    In["tampon mmap<br/>(emprunté)"] --> Check{"taille ≥<br/>min_payload ?"}
+    Check -->|"non"| Bad["CorruptedFrame<br/>(Skip)"]
+    Check -->|"oui"| ToRgb["demosaic_bilinear<br/>ou yuyv_to_rgb"]
+    ToRgb --> Rgb[("tampon RGB<br/>réutilisé")]
+    Rgb --> Wb["GrayWorld::apply<br/>(Bayer, désactivable)"]
+    Wb --> Jpeg["jpeg_encoder::Encoder<br/>qualité JpegQuality"]
+    Jpeg --> Out["Bytes JPEG<br/>(0 copie)"]
 ```
 
 ## Observer / Publish-Subscribe
@@ -125,6 +200,10 @@ classDiagram
     le conteneur mais webcam débranchée) doivent mener à `Reopen`, pas à une erreur fatale ;
   - côté entrant : `src/server/` adapte le `FrameHub` au protocole HTTP multipart
     (`src/server/mjpeg.rs`, fonction `stream` et `ClientSession`).
+- **Énumération des capacités** : `DeviceCapabilities` (`src/capture/v4l2/device.rs`) adapte
+  les ioctl `VIDIOC_ENUM_FMT`, `VIDIOC_ENUM_FRAMESIZES`, `VIDIOC_ENUM_FRAMEINTERVALS` de `v4l`
+  au port `CapabilityQuery` de la négociation (types `FourCc`, `SizeRange`, `IntervalRange`),
+  chaque appel sous `guarded()` ([ADR 0008](adr/0008-formats-bruts-et-conversion-jpeg.md)).
 - **Traduction des erreurs** : `src/capture/v4l2/errno.rs` (`map_open_error`, `map_io_error`).
 - **Traduction des paniques** : l'adaptateur ne laisse aucune panique de `v4l` atteindre le
   cœur. Les appels passent par `guarded()` (`src/capture/v4l2/guard.rs`), qui convertit une
@@ -167,6 +246,11 @@ classDiagram
   (`src/capture/factory.rs`), fabrique de test `ScriptedFactory` (`tests/support/mod.rs` :
   échecs, pertes et paniques scriptés, compteurs d'ouvertures et de sources vivantes).
   `App::with_factory` (`src/app.rs`) l'injecte dans l'application complète.
+- **Fabrique de stratégies de conversion** : `encoder_for` (`src/capture/convert/mod.rs`)
+  renvoie `JpegPassthrough` pour MJPEG et `RawJpegEncoder` pour YUYV/Bayer, après validation
+  de la géométrie (`RawLayout`) ; appelée par `V4l2Device::configure` et
+  `SyntheticRawSource::open`. `SourceFactory` choisit aussi la mire brute
+  (`SyntheticRawSource`) quand `CAMSTREAM_FORMAT` vaut `bayer` ou `yuyv`.
 
 ```mermaid
 classDiagram
@@ -188,7 +272,13 @@ classDiagram
     FrameSourceFactory <|.. ScriptedFactory
     CaptureSupervisor o-- FrameSourceFactory : injectée
     SourceFactory ..> V4l2Source : crée si V4l2
-    SourceFactory ..> SyntheticSource : crée si Synthetic
+    SourceFactory ..> SyntheticSource : crée si Synthetic et auto ou mjpeg
+    SourceFactory ..> SyntheticRawSource : crée si Synthetic et bayer ou yuyv
+    class encoder_for {
+        <<fonction fabrique>>
+    }
+    encoder_for ..> JpegPassthrough : MJPEG
+    encoder_for ..> RawJpegEncoder : YUYV, Bayer
 ```
 
 ## Builder
@@ -237,8 +327,8 @@ classDiagram
   routeur entier : il reçoit chaque réponse, ajoute les en-têtes **sans écraser** ceux déjà
   définis par un handler, et la renvoie inchangée par ailleurs (corps MJPEG compris, qui
   reste un flux).
-- **Portée** : distinct du Decorator écarté plus bas, qui concerne uniquement l'encodage
-  YUYV → JPEG des trames.
+- **Portée** : distinct du Decorator écarté plus bas, qui concernait l'encodage des trames
+  brutes en JPEG (résolu par une Strategy interne, voir [Strategy](#strategy)).
 
 ```mermaid
 sequenceDiagram
@@ -310,6 +400,9 @@ classDiagram
 | `DevicePath` | chemin de périphérique | `src/domain/device.rs` |
 | `HubCapacity` | non nulle (`broadcast` panique sur 0) | `src/stream/hub.rs` |
 | `MaxClients` | non nul | `src/server/mjpeg.rs` (réexporté par `server`) |
+| `JpegQuality` | de 1 à 100 (`DEFAULT` = 80) | `src/domain/frame.rs` |
+| `FourCc` | code V4L2 de 4 octets, affichage sans échec (octets non UTF-8) | `src/capture/negotiation.rs` |
+| `RawLayout` | géométrie convertible : pas de ligne ≥ minimal, côtés ≤ 65 535, Bayer ≥ 2x2 | `src/capture/convert/mod.rs` |
 
 ```mermaid
 classDiagram
@@ -426,7 +519,8 @@ classDiagram
 | Pattern | Raison de l'écarter |
 |---|---|
 | Builder pour la configuration | `clap` (derive + `env`) produit déjà la structure avec ses défauts ; les tests utilisent `AppConfig::try_parse_from` ou `Default` + syntaxe de mise à jour de structure. Un builder dupliquerait clap. |
-| Decorator pour l'encodage YUYV → JPEG | Nécessiterait un type de trame « brute » distinct dans le cœur pour un cas de repli unique ; un encodeur interne à `V4l2Source` suffit et préserve le contrat « trames JPEG » du port. À reconsidérer si d'autres transformations apparaissent (redimensionnement, horodatage incrusté). |
+| Decorator pour l'encodage des formats bruts (`EncodingSource<S: FrameSource>`) | Nécessiterait un type de trame « brute » distinct dans le cœur et une copie du tampon mmap pour le faire sortir de l'adaptateur ; la Strategy interne `FrameEncoder`, appliquée par les sources sur le tampon emprunté, préserve le contrat « trames JPEG » du port ([ADR 0008](adr/0008-formats-bruts-et-conversion-jpeg.md)). |
+| `FrameEncoder` / `CapabilityQuery` dans `domain` | Le cœur ne manipule jamais de trame brute ni de capacité de périphérique ; ces ports restent internes à `capture` (ADR 0008). |
 | State (GoF) pour le superviseur | Un `enum` et un `match` dans une boucle sont l'idiome Rust équivalent, plus lisible qu'une hiérarchie d'objets état. |
 | Singleton / état global | Interdit par `CLAUDE.md` ; tout est injecté par construction depuis `app`. |
 | Abstract Factory multi-familles | Une seule famille de produits (`FrameSource`) : la fabrique à une méthode suffit. |

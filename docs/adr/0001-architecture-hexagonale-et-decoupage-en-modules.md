@@ -91,6 +91,15 @@ nouvel ADR.
 > la configuration est lue par `Command::load` (`Serve(AppConfig)` ou
 > `Healthcheck(HealthcheckConfig)`). Détails : [architecture § 11](../architecture.md#11-écarts-entre-la-conception-initiale-et-limplémentation).
 
+> **Complément (formats bruts, revue du 2026-11-27, [ADR 0008](0008-formats-bruts-et-conversion-jpeg.md))** :
+> `capture` définit désormais deux **ports internes à l'adaptateur**, `CapabilityQuery`
+> (énumération des capacités, `src/capture/negotiation.rs`) et `FrameEncoder` (conversion en
+> JPEG, `src/capture/convert/`), invisibles du cœur. `domain` gagne du vocabulaire (formats
+> Bayer, qualité JPEG, balance des blancs, origine de l'encodage) mais aucune dépendance :
+> `jpeg-encoder` n'est utilisé que dans `capture`. Règle confirmée : les types de
+> configuration placés dans `domain` (portés par `CaptureSettings`) sont des valeurs sans
+> comportement ; les algorithmes restent dans les adaptateurs.
+
 ## Conséquences
 
 - Les tests du cœur et du serveur utilisent la source synthétique (`SyntheticSource`) et une

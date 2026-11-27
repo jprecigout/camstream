@@ -12,7 +12,7 @@ use axum::Json;
 use serde::Serialize;
 
 use super::routes::ServerState;
-use crate::domain::SourceDescription;
+use crate::domain::{FpsOrigin, FrameEncoding, SourceDescription};
 use crate::stream::SourceStatus;
 
 /// Santé globale exposée dans le champ `status` de `/health` (`"ok"` ou `"failed"`).
@@ -117,26 +117,46 @@ impl From<&SourceStatus> for CameraReport {
     }
 }
 
-/// DTO de `SourceDescription` (nom, format, `"640x480"`, cadence).
+/// DTO de `SourceDescription` (nom, format, `"640x480"`, cadence, encodage).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SourceReport {
     /// Nom de la source (carte de la webcam ou mire).
     pub name: String,
-    /// Format natif (`MJPEG`).
+    /// Format natif négocié avec la caméra (`MJPEG`, `YUYV`, `BA81`, `GBRG`, `GRBG`,
+    /// `RGGB`).
     pub pixel_format: &'static str,
     /// Résolution effective (`LARGEURxHAUTEUR`).
     pub resolution: String,
-    /// Cadence effective.
+    /// Cadence effective, ou seulement demandée (voir `fps_origin`).
     pub fps: u32,
+    /// `confirmed` (cadence confirmée par la source) ou `requested` (pilote sans
+    /// réglage de cadence : valeur demandée, cadence réelle inconnue).
+    pub fps_origin: &'static str,
+    /// Origine des JPEG : `native` (MJPEG de la caméra) ou `software` (encodés sur le
+    /// Pi).
+    pub encoding: &'static str,
+    /// Qualité JPEG, présente pour l'encodage `software`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jpeg_quality: Option<u8>,
 }
 
 impl From<&SourceDescription> for SourceReport {
     fn from(description: &SourceDescription) -> Self {
+        let (encoding, jpeg_quality) = match description.encoding {
+            FrameEncoding::Native => ("native", None),
+            FrameEncoding::Software { quality } => ("software", Some(quality.get())),
+        };
         Self {
             name: description.name.clone(),
             pixel_format: description.pixel_format.as_str(),
             resolution: description.resolution.to_string(),
             fps: description.fps.get(),
+            fps_origin: match description.fps_origin {
+                FpsOrigin::Confirmed => "confirmed",
+                FpsOrigin::Requested => "requested",
+            },
+            encoding,
+            jpeg_quality,
         }
     }
 }
@@ -262,7 +282,7 @@ fn parse_status_code(line: &str) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{Fps, PixelFormat, Resolution};
+    use crate::domain::{BayerPattern, Fps, JpegQuality, PixelFormat, Resolution};
 
     fn json(status: &SourceStatus, clients: usize) -> String {
         serde_json::to_string(&HealthReport::new(status, clients)).unwrap()
@@ -288,11 +308,33 @@ mod tests {
                 pixel_format: PixelFormat::Mjpeg,
                 resolution: Resolution::new(640, 480).unwrap(),
                 fps: Fps::new(15).unwrap(),
+                fps_origin: FpsOrigin::Confirmed,
+                encoding: FrameEncoding::Native,
             },
         };
         assert_eq!(
             json(&status, 2),
-            r#"{"status":"ok","camera":{"state":"streaming","source":{"name":"Cam","pixel_format":"MJPEG","resolution":"640x480","fps":15}},"clients":2}"#
+            r#"{"status":"ok","camera":{"state":"streaming","source":{"name":"Cam","pixel_format":"MJPEG","resolution":"640x480","fps":15,"fps_origin":"confirmed","encoding":"native"}},"clients":2}"#
+        );
+    }
+
+    #[test]
+    fn streaming_report_shows_software_encoding() {
+        let status = SourceStatus::Streaming {
+            source: SourceDescription {
+                name: "Pi cam".into(),
+                pixel_format: PixelFormat::Bayer8(BayerPattern::Grbg),
+                resolution: Resolution::new(324, 240).unwrap(),
+                fps: Fps::new(15).unwrap(),
+                fps_origin: FpsOrigin::Requested,
+                encoding: FrameEncoding::Software {
+                    quality: JpegQuality::DEFAULT,
+                },
+            },
+        };
+        assert_eq!(
+            json(&status, 1),
+            r#"{"status":"ok","camera":{"state":"streaming","source":{"name":"Pi cam","pixel_format":"GRBG","resolution":"324x240","fps":15,"fps_origin":"requested","encoding":"software","jpeg_quality":80}},"clients":1}"#
         );
     }
 

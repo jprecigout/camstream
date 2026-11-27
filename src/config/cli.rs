@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use crate::domain::{FormatPreference, Resolution, SourceKind};
+use crate::domain::{FormatPreference, Resolution, SourceKind, WhiteBalance};
 
 /// Ligne de commande de Camstream (les textes d'aide, techniques, sont en anglais).
 #[derive(Debug, Parser)]
@@ -86,12 +86,14 @@ pub struct ServeArgs {
         help = "V4L2 capture device"
     )]
     pub device: PathBuf,
-    /// Résolution demandée ; le pilote peut en retenir une proche.
+    /// Résolution demandée ; la plus grande taille proposée qui y tient est retenue,
+    /// sinon la plus petite au-dessus (ADR 0008).
     #[arg(
         long,
         env = "CAMSTREAM_RESOLUTION",
         default_value = "640x480",
-        help = "Requested resolution (WIDTHxHEIGHT); the driver may pick a close one"
+        help = "Requested resolution (WIDTHxHEIGHT); the largest size offered by the camera \
+                that fits is used, otherwise the smallest one above"
     )]
     pub resolution: Resolution,
     /// Cadence demandée (1 à 120 i/s).
@@ -99,10 +101,22 @@ pub struct ServeArgs {
           value_parser = clap::value_parser!(u32).range(1..=120),
           help = "Requested frame rate (frames per second)")]
     pub fps: u32,
-    /// Format de pixels ; MJPEG obligatoire en v1 (`auto` = `mjpeg`, `yuyv` refusé).
+    /// Format de pixels : `auto` (MJPEG natif, sinon YUYV, sinon Bayer 8 bits) ou un
+    /// format exigé.
     #[arg(long, env = "CAMSTREAM_FORMAT", value_enum, default_value_t = FormatArg::Auto,
-          help = "Pixel format: MJPEG is required in v1 (auto = mjpeg, yuyv is refused)")]
+          help = "Pixel format: auto = native MJPEG, else YUYV, else 8-bit Bayer \
+                  (raw formats are encoded to JPEG on the device)")]
     pub format: FormatArg,
+    /// Qualité JPEG de l'encodage logiciel des formats bruts (1 à 100).
+    #[arg(long, env = "CAMSTREAM_JPEG_QUALITY", default_value_t = 80,
+          value_parser = clap::value_parser!(u8).range(1..=100),
+          help = "JPEG quality (1-100) for raw formats encoded on the device; ignored for MJPEG")]
+    pub jpeg_quality: u8,
+    /// Balance des blancs des formats Bayer.
+    #[arg(long, env = "CAMSTREAM_WHITE_BALANCE", value_enum,
+          default_value_t = WhiteBalanceArg::GrayWorld,
+          help = "White balance applied to Bayer formats")]
+    pub white_balance: WhiteBalanceArg,
     /// Attente maximale d'une trame avant de considérer la webcam figée (rouverte).
     #[arg(long, env = "CAMSTREAM_READ_TIMEOUT_MS", default_value_t = 2000,
           value_parser = clap::value_parser!(u64).range(1..),
@@ -189,15 +203,20 @@ impl From<SourceArg> for SourceKind {
 /// Valeur CLI de la préférence de format (miroir de [`FormatPreference`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum FormatArg {
-    /// MJPEG si disponible (seul format pris en charge en v1).
-    #[value(help = "MJPEG if available (the only supported format in v1)")]
+    /// MJPEG natif si proposé, sinon YUYV, sinon Bayer 8 bits.
+    #[value(help = "Native MJPEG if offered, else YUYV, else 8-bit Bayer")]
     Auto,
     /// MJPEG exigé.
-    #[value(help = "Require MJPEG")]
+    #[value(help = "Require native MJPEG (no encoding on the device)")]
     Mjpeg,
-    /// YUYV forcé (phase 2, refusé en v1).
-    #[value(help = "Force YUYV (phase 2, refused in v1)")]
+    /// YUYV exigé.
+    #[value(help = "Require YUYV (encoded to JPEG on the device)")]
     Yuyv,
+    /// Bayer 8 bits exigé (BA81, GBRG, GRBG ou RGGB).
+    #[value(
+        help = "Require 8-bit Bayer: BA81, GBRG, GRBG or RGGB (encoded to JPEG on the device)"
+    )]
+    Bayer,
 }
 
 impl From<FormatArg> for FormatPreference {
@@ -206,6 +225,27 @@ impl From<FormatArg> for FormatPreference {
             FormatArg::Auto => Self::Auto,
             FormatArg::Mjpeg => Self::Mjpeg,
             FormatArg::Yuyv => Self::Yuyv,
+            FormatArg::Bayer => Self::Bayer,
+        }
+    }
+}
+
+/// Valeur CLI de la balance des blancs (miroir de [`WhiteBalance`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum WhiteBalanceArg {
+    /// Hypothèse « monde gris », lissée d'une trame à l'autre.
+    #[value(help = "Gray-world automatic white balance")]
+    GrayWorld,
+    /// Aucune correction.
+    #[value(help = "No correction (raw sensor colors)")]
+    Off,
+}
+
+impl From<WhiteBalanceArg> for WhiteBalance {
+    fn from(value: WhiteBalanceArg) -> Self {
+        match value {
+            WhiteBalanceArg::GrayWorld => Self::GrayWorld,
+            WhiteBalanceArg::Off => Self::Off,
         }
     }
 }

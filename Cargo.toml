@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
 publish = false
-description = "Stream a USB webcam (V4L2, native MJPEG) to web browsers, built for Raspberry Pi"
+description = "Stream a USB webcam (V4L2, native MJPEG or raw formats encoded to JPEG) to web browsers, built for Raspberry Pi"
 repository = "https://github.com/jprecigout/camstream"
 readme = "README.md"
 
@@ -23,6 +23,9 @@ axum = { version = "0.8", default-features = false, features = ["http1", "json",
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 futures-util = { version = "0.3", default-features = false }
+# Encodage JPEG logiciel des formats bruts (Bayer, YUYV), 100 % Rust, sans dépendance ;
+# feature `simd` non activée (AVX2 x86 uniquement, inutile sur aarch64). ADR 0008.
+jpeg-encoder = { version = "0.7", default-features = false, features = ["std"] }
 libc = { version = "0.2", optional = true }
 serde = { version = "1", features = ["derive"] }
 # Feature `all` requise pour `TCP_USER_TIMEOUT` et le nombre de sondes keepalive.
@@ -36,6 +39,8 @@ v4l = { version = "0.14", default-features = false, features = ["v4l2"], optiona
 
 [dev-dependencies]
 http-body-util = "0.1"
+# Décodage des JPEG produits par le convertisseur dans les tests (dimensions, couleurs).
+jpeg-decoder = { version = "0.3", default-features = false }
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 serde_json = "1"
@@ -44,3 +49,8 @@ tower = { version = "0.5", features = ["util"] }
 [profile.release]
 strip = "symbols"
 lto = "thin"
+
+# L'encodeur JPEG est optimisé même en mode debug : les tests de bout en bout encodent
+# des dizaines de trames 640x480 par seconde, et `cargo run` reste représentatif.
+[profile.dev.package.jpeg-encoder]
+opt-level = 3

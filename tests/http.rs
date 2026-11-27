@@ -127,6 +127,9 @@ async fn health_reports_camera_state_and_clients() {
     assert_eq!(json["camera"]["source"]["name"], "synthetic test pattern");
     assert_eq!(json["camera"]["source"]["resolution"], "640x480");
     assert_eq!(json["camera"]["source"]["fps"], 50);
+    assert_eq!(json["camera"]["source"]["pixel_format"], "MJPEG");
+    assert_eq!(json["camera"]["source"]["encoding"], "native");
+    assert!(json["camera"]["source"].get("jpeg_quality").is_none());
     assert_eq!(json["clients"], 1);
 
     // Dernier client parti : la webcam s'éteint après le délai de grâce (200 ms).
