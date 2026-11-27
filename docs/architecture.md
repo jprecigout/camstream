@@ -48,6 +48,7 @@ src/
 ├── main.rs              # point d'entrée : config, logs, runtime, signaux, codes de sortie (anyhow)
 ├── lib.rs               # expose les modules (tests d'intégration) ; #![forbid(unsafe_code)]
 ├── app.rs               # racine de composition : App, BoundApp, Outcome (anyhow)
+├── banner.rs            # Banner : texte de la bannière de démarrage (dégradé du logo), affiché par main
 ├── domain/              # CŒUR — types et ports, aucune dépendance technique
 │   ├── mod.rs
 │   ├── frame.rs         # Frame, Resolution, Fps, SequenceNumber, PixelFormat, ParseResolutionError

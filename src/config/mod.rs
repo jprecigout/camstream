@@ -110,6 +110,8 @@ pub struct AppConfig {
     pub shutdown_timeout: Duration,
     /// Trames invalides consécutives tolérées avant de rouvrir la webcam.
     pub max_corrupted_frames: NonZeroU32,
+    /// Affiche la bannière de démarrage (désactivable par `--no-banner`).
+    pub banner: bool,
 }
 
 impl AppConfig {
@@ -175,6 +177,7 @@ impl AppConfig {
             idle_timeout: Duration::from_millis(args.idle_timeout_ms),
             shutdown_timeout: Duration::from_millis(args.shutdown_timeout_ms),
             max_corrupted_frames: args.max_corrupted_frames,
+            banner: !args.no_banner,
         })
     }
 }
@@ -203,6 +206,12 @@ mod tests {
             Command::Serve(config) => Ok(config),
             Command::Healthcheck(_) => panic!("expected serve"),
         }
+    }
+
+    #[test]
+    fn banner_is_shown_unless_disabled() {
+        assert!(serve(&[]).unwrap().banner);
+        assert!(!serve(&["--no-banner"]).unwrap().banner);
     }
 
     #[test]

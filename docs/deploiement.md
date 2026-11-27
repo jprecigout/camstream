@@ -268,6 +268,7 @@ l'environnement. Les valeurs invalides provoquent un arrêt immédiat avec un me
 | `CAMSTREAM_SHUTDOWN_TIMEOUT_MS` | `--shutdown-timeout-ms` | `5000` | Délai maximal de l'arrêt gracieux (doit dépasser le délai de lecture) |
 | `CAMSTREAM_HEALTHCHECK_TIMEOUT_MS` | `healthcheck --timeout-ms` | `2000` | Durée **totale** maximale de la sonde `healthcheck` (connexion, envoi, lecture) ; à garder sous le `--timeout` du `HEALTHCHECK` (3 s) |
 | `CAMSTREAM_JPEG_QUALITY` | — | — | **Non implémentée en v1** : qualité JPEG du repli YUYV, prévue en phase 2 |
+| `CAMSTREAM_NO_BANNER` | `--no-banner` | `false` | Désactive la bannière de démarrage (nom en couleurs, version, source, URL du flux), affichée sur la sortie standard avant les logs ; couleurs seulement sur un terminal, hors `TERM=dumb` et sans `NO_COLOR` |
 | `RUST_LOG` | — | `info` | Filtre `tracing` (ex. `camstream=debug`) |
 
 Les défauts 640x480, 15 i/s et 10 clients sont confirmés (moins de 10 spectateurs prévus).

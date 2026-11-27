@@ -156,6 +156,13 @@ pub struct ServeArgs {
           value_parser = clap::value_parser!(u64).range(1..),
           help = "Maximum duration (ms) of the graceful shutdown")]
     pub shutdown_timeout_ms: u64,
+    /// Désactive la bannière de démarrage (`CAMSTREAM_NO_BANNER=true`).
+    #[arg(
+        long,
+        env = "CAMSTREAM_NO_BANNER",
+        help = "Do not print the startup banner"
+    )]
+    pub no_banner: bool,
 }
 
 /// Valeur CLI du type de source (miroir de [`SourceKind`] : `domain` ne dépend pas

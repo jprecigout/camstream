@@ -107,6 +107,7 @@ Toutes les options existent en ligne de commande et en variable d'environnement
 | `CAMSTREAM_IDLE_TIMEOUT_MS` | `10000` | Délai avant d'éteindre la webcam sans spectateur |
 | `CAMSTREAM_MAX_CLIENTS` | `10` | Spectateurs simultanés maximum |
 | `CAMSTREAM_READ_TIMEOUT_MS` / `CAMSTREAM_SHUTDOWN_TIMEOUT_MS` | `2000` / `5000` | Attente d'une trame / durée de l'arrêt gracieux (le premier doit rester inférieur au second) |
+| `CAMSTREAM_NO_BANNER` | `false` | `true` désactive la bannière de démarrage (nom, version, source, URL du flux) |
 | `CAMSTREAM_MAX_CORRUPTED_FRAMES` | `30` | Trames corrompues consécutives tolérées avant de rouvrir la webcam |
 
 Liste complète : [deploiement.md § 5](docs/deploiement.md#5-variables-denvironnement).

@@ -7,12 +7,13 @@
 #![forbid(unsafe_code)]
 
 use std::future::Future;
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::Context;
 use camstream::app::App;
+use camstream::banner::{Banner, ColorMode};
 use camstream::config::{AppConfig, Command, ConfigError, HealthcheckConfig};
 use camstream::server::health;
 use tokio::signal::unix::{signal, SignalKind};
@@ -61,6 +62,9 @@ fn init_tracing() {
 
 /// Démarre le runtime multi-thread et l'application jusqu'à l'arrêt.
 fn serve(config: AppConfig) -> anyhow::Result<camstream::app::Outcome> {
+    if config.banner {
+        print_banner(&config);
+    }
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         source = %config.capture.kind,
@@ -83,6 +87,28 @@ fn serve(config: AppConfig) -> anyhow::Result<camstream::app::Outcome> {
     // expiré) : le processus doit quitter.
     runtime.shutdown_timeout(RUNTIME_SHUTDOWN_GRACE);
     result
+}
+
+/// Affiche la bannière de démarrage sur la sortie standard, avant les logs.
+///
+/// Écriture directe et non `tracing` : c'est un affichage pour l'humain, pas un
+/// événement de log (le résumé structuré reste émis par `starting camstream`).
+/// Couleurs uniquement sur un terminal, hors `TERM=dumb` et sans `NO_COLOR` non vide
+/// (<https://no-color.org>).
+fn print_banner(config: &AppConfig) {
+    let stdout = std::io::stdout();
+    let no_color = std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty());
+    let dumb = std::env::var_os("TERM").is_some_and(|term| term == "dumb");
+    let colored = stdout.is_terminal() && !no_color && !dumb;
+    let mode = if colored {
+        ColorMode::TrueColor
+    } else {
+        ColorMode::Plain
+    };
+    let text = Banner::new(config, env!("CARGO_PKG_VERSION")).render(mode);
+    // Une sortie fermée ou pleine ne doit pas empêcher le serveur de démarrer.
+    let mut out = stdout.lock();
+    let _ = out.write_all(text.as_bytes()).and_then(|()| out.flush());
 }
 
 /// Installe les gestionnaires de `SIGTERM` (`docker stop`) et `SIGINT` (Ctrl+C) et

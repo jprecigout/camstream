@@ -307,6 +307,7 @@ pub fn test_config() -> AppConfig {
         idle_timeout: Duration::from_millis(200),
         shutdown_timeout: Duration::from_secs(3),
         max_corrupted_frames: 30.try_into().unwrap(),
+        banner: false,
     }
 }
 
